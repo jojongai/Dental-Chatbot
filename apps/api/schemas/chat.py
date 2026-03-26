@@ -95,31 +95,6 @@ class ChatAction(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class CallerStatus(StrEnum):
-    """Result of matching caller_phone to a patient record before booking flows."""
-
-    EXISTING = "existing"  # Found in DB — may book / reschedule with verification as needed
-    UNKNOWN = "unknown"  # No match — treat as new caller until registered
-
-
-class CallerContext(BaseModel):
-    """
-    Returned on session open and echoed for UI (badge: returning vs new).
-    Populated when caller_phone is provided and a practice is known.
-    """
-
-    status: CallerStatus
-    patient_id: str | None = None
-    first_name: str | None = None
-    last_name: str | None = None
-    is_existing_patient: bool | None = None
-    match_confidence: float = Field(
-        0.0,
-        ge=0.0,
-        le=1.0,
-        description="1.0 when phone + name/DOB align; 0.8 phone-only match",
-    )
-
 
 class WorkflowState(BaseModel):
     """
@@ -168,10 +143,6 @@ class ChatRequest(BaseModel):
     state
         The WorkflowState from the previous response, echoed back so the server
         can resume mid-workflow without a DB read on every turn.
-    caller_phone
-        The patient's phone number as captured from caller ID by the SMS gateway.
-        When present on the first turn the server pre-populates the phone field so
-        the chatbot never has to ask for it again.
     is_session_opening
         When True, simulates the first outbound SMS after a missed call: runs
         caller lookup by phone, returns Maya's opening line, and skips the state
@@ -181,11 +152,6 @@ class ChatRequest(BaseModel):
     session_id: str = Field(..., examples=["abc123"])
     message: str = Field(default="", examples=["I want to book a cleaning next week"])
     state: WorkflowState | None = None
-    caller_phone: str | None = Field(
-        None,
-        description="Phone number from caller ID. Injected by the SMS gateway on the first turn.",
-        examples=["+14165550100"],
-    )
     is_session_opening: bool = Field(
         False,
         description="First SMS after missed call — opening message + caller identification only.",
@@ -212,12 +178,9 @@ class ChatResponse(BaseModel):
         Structured UI hints (e.g. show a slot picker, confirm booking).
     tools_called
         Names of tools invoked this turn (transparency / debug).
-    caller_context
-        Set when caller_phone was used for identification (session open or first turn).
     """
 
     reply: str
     state: WorkflowState
     actions: list[ChatAction] = Field(default_factory=list)
     tools_called: list[str] = Field(default_factory=list)
-    caller_context: CallerContext | None = None

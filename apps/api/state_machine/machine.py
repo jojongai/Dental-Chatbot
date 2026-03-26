@@ -67,60 +67,29 @@ class MachineResult:
 
 
 # ---------------------------------------------------------------------------
-# Keyword-based workflow intent detection
+# Workflow intent detection
 # ---------------------------------------------------------------------------
-
-_INTENT_MAP: list[tuple[list[str], Workflow]] = [
-    # Order matters — more specific phrases first
-    (
-        [
-            "emergency",
-            "severe pain",
-            "broken tooth",
-            "cracked tooth",
-            "abscess",
-            "swollen",
-            "knocked out",
-            "toothache",
-            "bleeding gum",
-        ],
-        Workflow.EMERGENCY_TRIAGE,
-    ),
-    (["new patient", "register", "first time", "first visit", "sign up"], Workflow.NEW_PATIENT_REGISTRATION),
-    (
-        ["reschedule", "move my appointment", "change my appointment", "different time", "different day"],
-        Workflow.RESCHEDULE_APPOINTMENT,
-    ),
-    (["cancel"], Workflow.CANCEL_APPOINTMENT),
-    (
-        ["family", "kids", "children", "my kid", "spouse", "husband", "wife", "son", "daughter", "partner"],
-        Workflow.FAMILY_BOOKING,
-    ),
-    (
-        ["book", "schedule", "appointment", "cleaning", "checkup", "check-up", "exam", "visit", "coming in"],
-        Workflow.BOOK_APPOINTMENT,
-    ),
-    (["speak to", "talk to", "human", "person", "staff", "someone", "representative", "call me"], Workflow.HANDOFF),
-]
-
 
 def detect_intent(message: str, current: WorkflowState) -> Workflow:
     """
-    Return the detected workflow.
-    If the user is already mid-workflow, stay in it unless they signal a hard pivot.
+    Return the detected workflow for this message.
+
+    Mid-workflow guard runs first — once a workflow is active the machine stays
+    in it unless the user explicitly asks to start over. This guard is purely
+    deterministic and never calls the LLM.
+
+    For new conversations (workflow == GENERAL_INQUIRY) intent classification
+    is delegated to llm/intent.py, which uses Gemini when USE_LLM=true and
+    falls back to keyword matching otherwise.
     """
     if current.workflow not in (Workflow.GENERAL_INQUIRY,):
-        # Allow escape hatches mid-workflow
         lower = message.lower()
         if any(k in lower for k in ("start over", "cancel everything", "different question")):
             return Workflow.GENERAL_INQUIRY
         return current.workflow  # stay in current workflow
 
-    lower = message.lower()
-    for keywords, workflow in _INTENT_MAP:
-        if any(k in lower for k in keywords):
-            return workflow
-    return Workflow.GENERAL_INQUIRY
+    from llm.intent import classify_intent
+    return classify_intent(message)
 
 
 # ---------------------------------------------------------------------------

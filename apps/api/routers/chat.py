@@ -19,8 +19,6 @@ from sqlalchemy.orm import Session
 
 from database import get_db
 from schemas.chat import (
-    CallerContext,
-    CallerStatus,
     ChatRequest,
     ChatResponse,
     WorkflowState,
@@ -65,29 +63,15 @@ async def post_chat(
         return ChatResponse(
             reply=OPENING_SMS_TEXT,
             state=WorkflowState(),
-            caller_context=None,
             tools_called=[],
         )
 
     is_first_turn = body.state is None
     current_state = body.state or WorkflowState()
 
-    # Pre-populate phone from caller ID so the bot never has to ask for it.
-    if body.caller_phone and "phone_number" not in current_state.collected_fields:
-        current_state = current_state.model_copy(
-            update={"collected_fields": {**current_state.collected_fields, "phone_number": body.caller_phone}}
-        )
-
-    # Match caller_phone to a patient record once (before workflows that need patient_id).
-    caller_context: CallerContext | None = None
-    if body.caller_phone and not current_state.patient_id:
-        caller_context, pid = _caller_lookup(db, body.caller_phone, practice_id)
-        if pid:
-            current_state = current_state.model_copy(update={"patient_id": pid})
-
     # --- slot selection turn (user chose from presented options) ---
     if current_state.step == "selecting_slot" and current_state.slot_options:
-        return _handle_slot_selection(body.message, current_state, db, practice_id, caller_context)
+        return _handle_slot_selection(body.message, current_state, db, practice_id)
 
     # --- disambiguation retry: two records matched → user replied with email ---
     if current_state.step == "disambiguating":
@@ -117,7 +101,6 @@ async def post_chat(
         state=updated_state,
         actions=result.actions,
         tools_called=tools_called,
-        caller_context=caller_context,
     )
 
 
@@ -474,7 +457,6 @@ def _handle_slot_selection(
     state: WorkflowState,
     db: Session,
     practice_id: str,
-    caller_context: CallerContext | None,
 ) -> ChatResponse:
     """
     Parse the user's slot choice, book it, return confirmation.
@@ -487,11 +469,31 @@ def _handle_slot_selection(
     choice = extract_slot_choice(message)
 
     if choice is None or choice < 1 or choice > len(state.slot_options):
+        # Patient may be asking for a different date rather than picking a slot.
+        # Try to extract a new date preference from the message and re-search.
+        from state_machine.extractors import extract_preferred_date, extract_time_of_day
+
+        new_date = extract_preferred_date(message)
+        if new_date is not None or _is_slot_rejection(message):
+            search_data = dict(state.collected_fields)
+            if new_date:
+                search_data["preferred_date_from"] = new_date
+            new_time = extract_time_of_day(message)
+            if new_time:
+                search_data["preferred_time_of_day"] = new_time
+
+            reply, new_state, _ = _search_and_present_slots(
+                search_data,
+                state,
+                db,
+                preamble="No problem — let me check other times." if not new_date else "",
+            )
+            return ChatResponse(reply=reply, state=new_state)
+
         available = len(state.slot_options)
         return ChatResponse(
             reply=f"Please reply with a number between 1 and {available} to choose a slot.",
             state=state,
-            caller_context=caller_context,
         )
 
     chosen = state.slot_options[choice - 1]
@@ -525,7 +527,6 @@ def _handle_slot_selection(
                     "Reply with 1 or 2 to choose."
                 ),
                 state=new_state,
-                caller_context=caller_context,
             )
         return ChatResponse(
             reply=(
@@ -533,7 +534,6 @@ def _handle_slot_selection(
                 "Want me to search a different date or time?"
             ),
             state=state.model_copy(update={"step": "collecting", "slot_options": []}),
-            caller_context=caller_context,
         )
 
     a = result.appointment
@@ -559,7 +559,6 @@ def _handle_slot_selection(
         state=new_state,
         actions=[],
         tools_called=["book_appointment"],
-        caller_context=caller_context,
     )
 
 
@@ -588,36 +587,23 @@ def _infer_clinic_category(message: str) -> str | None:
     return best  # None → all categories returned
 
 
+def _is_slot_rejection(message: str) -> bool:
+    """Return True if the patient is declining the presented slots."""
+    lower = message.lower()
+    rejection_phrases = [
+        "none of those", "none of them", "don't work", "doesn't work",
+        "can't do", "cannot do", "not available", "other options",
+        "different", "something else", "other time", "other day",
+        "no thanks", "not those", "any other",
+    ]
+    return any(p in lower for p in rejection_phrases)
+
+
 def _is_payment_question(message: str) -> bool:
     payment_words = ["payment", "pay", "no insurance", "uninsured", "self pay", "self-pay", "financing", "membership", "afford", "cost", "price", "fee"]
     lower = message.lower()
     return any(w in lower for w in payment_words)
 
-
-def _caller_lookup(db: Session, phone: str, practice_id: str) -> tuple[CallerContext, str | None]:
-    """
-    Match caller ID to patients.phone_number (normalized). Used before booking flows.
-    Returns (CallerContext, patient_id or None).
-    """
-    from schemas.tools import LookupPatientInput
-    from tools.patient_tools import lookup_patient
-
-    # Phone-only call — relies on the 0.8-confidence strategy in lookup_patient.
-    lo = lookup_patient(db, LookupPatientInput(phone_number=phone), practice_id)
-    if lo.found and lo.patient:
-        p = lo.patient
-        return (
-            CallerContext(
-                status=CallerStatus.EXISTING,
-                patient_id=p.id,
-                first_name=p.first_name,
-                last_name=p.last_name,
-                is_existing_patient=p.is_existing_patient,
-                match_confidence=lo.match_confidence,
-            ),
-            p.id,
-        )
-    return (CallerContext(status=CallerStatus.UNKNOWN, match_confidence=0.0), None)
 
 
 def _default_practice_id(db: Session) -> str:
