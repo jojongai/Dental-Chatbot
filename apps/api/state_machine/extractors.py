@@ -99,6 +99,18 @@ def extract_phone(text: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Email address
+# ---------------------------------------------------------------------------
+
+_EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
+
+
+def extract_email(text: str) -> str | None:
+    m = _EMAIL_RE.search(text)
+    return m.group(0).lower() if m else None
+
+
+# ---------------------------------------------------------------------------
 # Date of birth
 # ---------------------------------------------------------------------------
 
@@ -392,6 +404,47 @@ def extract_group_preference(text: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Slot choice (1 / 2 / 3 / "first" / "second" / "the third one")
+# ---------------------------------------------------------------------------
+
+
+def extract_slot_choice(text: str) -> int | None:
+    """
+    Returns 1-based index of the chosen slot, or None if not found.
+    Handles digits ("1", "2"), ordinal words ("first", "second", "third"),
+    and phrases like "option 2" or "the second one".
+    """
+    import re
+
+    lower = text.strip().lower()
+
+    _ORDINALS = {
+        "first": 1, "1st": 1, "one": 1,
+        "second": 2, "2nd": 2, "two": 2,
+        "third": 3, "3rd": 3, "three": 3,
+        "fourth": 4, "4th": 4, "four": 4,
+        "fifth": 5, "5th": 5, "five": 5,
+    }
+
+    # "option 2", "number 2", "slot 2"
+    m = re.search(r"(?:option|number|slot|#)\s*([1-5])", lower)
+    if m:
+        return int(m.group(1))
+
+    # bare digit 1-5 with word boundary
+    m = re.search(r"\b([1-5])\b", lower)
+    if m:
+        return int(m.group(1))
+
+    # ordinal words
+    for word, idx in _ORDINALS.items():
+        if re.search(rf"\b{re.escape(word)}\b", lower):
+            return idx
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Confirmation (yes/no)
 # ---------------------------------------------------------------------------
 
@@ -448,4 +501,5 @@ FIELD_EXTRACTORS: dict[str, Any] = {
     "group_preference": extract_group_preference,
     "confirmation": extract_confirmation,
     "family_count": extract_family_count,
+    "slot_choice": extract_slot_choice,
 }

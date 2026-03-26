@@ -84,92 +84,190 @@ These flows collect patient information before calling a scheduling tool.
 Flows that require a `patient_id` automatically pivot to **Patient Verification** as
 a sub-workflow first, then resume the original flow.
 
-### 5. New Patient Registration 🔧 Stub
+### 5. New Patient Booking ✅ Live
 
-**Trigger phrases:** "I'm a new patient", "I'd like to register", "First time here"
+**Trigger phrases:** "I'm a new patient", "I'd like to register", "First time here", "Never been before"
 
 **Fields collected (in order):**
 
-| Field | Example |
-|-------|---------|
-| Full name | "My name is Sarah Chen" |
-| Phone number | "(416) 555-1234" |
-| Date of birth | "March 14, 1985" |
-| Insurance name | "Sun Life" / "I don't have insurance" |
-| Appointment type | "cleaning", "checkup", "new patient exam" |
-| Preferred date | "next Tuesday", "sometime next week" |
+| Field | Example | Extractor |
+|-------|---------|-----------|
+| Full name | "My name is Sarah Chen" | `extract_full_name` |
+| Phone number | "(416) 555-1234" | `extract_phone` |
+| Date of birth | "March 14, 1985" | `extract_dob` |
+| Insurance name | "Sun Life" / "I don't have insurance" | `extract_insurance` |
+| Appointment type | "cleaning", "checkup", "new patient exam" | `extract_appointment_type` |
+| Preferred date | "next Tuesday", "sometime next week" | `extract_preferred_date` |
 
-**Optional fields (extracted if mentioned):** preferred time of day
+**Optional fields (extracted if mentioned):** preferred time of day (`morning` / `afternoon` / `any`)
 
 **Flow:**
-1. Chatbot greets new patient and asks for each field in order.
-2. Fields are extracted from free-text via regex/keyword extractors (no LLM).
-3. When all fields are collected → confirmation summary shown.
-4. Patient confirms → `create_patient` tool called.
-5. *(Next step — stub pending):* `search_slots` called to find available times.
+```
+Opening SMS
+    │
+    ▼
+User: "I'm a new patient"
+    │
+    ▼
+Collect fields (one prompt per missing field, extracted inline if volunteered)
+    │
+    ▼  all fields present
+create_patient ──► validates phone (10-digit NANP)
+                ► validates DOB (must be in the past, realistic age)
+                ► checks for duplicate phone number
+                ► fuzzy-links InsurancePlan if insurance_name matches a known carrier
+                ► patient status set to "lead"
+    │
+    ▼  patient created
+search_slots (same turn, auto)
+    │
+    ├─ No slots found → ask for different date / time
+    │
+    ▼  slots found
+Present up to 3 options:
+  "1. Mon Apr 14, 10:00 AM
+   2. Tue Apr 15, 11:00 AM
+   3. Wed Apr 16, 2:00 PM"
+    │
+    ▼  user replies "1" / "first" / "option 2"
+book_appointment ──► locks slot (SELECT FOR UPDATE equivalent)
+                 ► creates Appointment (status="booked", booked_via="chatbot")
+                 ► returns confirmation message
+    │
+    ▼
+"You're all set! See you Mon Apr 14 at 10:00 AM. Reply CANCEL to cancel."
+```
 
-**Tools:** `create_patient` → `search_slots` → `book_appointment`
-**Requires confirmation before tool call: yes**
+**Validation / normalisation enforced:**
+
+| Check | Behaviour on failure |
+|-------|---------------------|
+| Phone format | Re-ask with specific error ("That phone number doesn't look right — 10 digits, please") |
+| DOB in the past | Re-ask ("Date of birth must be a past date") |
+| Duplicate phone | Return error ("A patient with that phone is already registered — are you an existing patient?") |
+| Appointment type | Fuzzy-mapped to canonical code; unknown type → re-ask |
+| Slot taken between search and book | Remove from options, re-present remaining slots |
+
+**Tools called:** `create_patient` → `search_slots` (auto-chained, same turn) → `book_appointment` (after slot selection)
 
 ---
 
-### 6. Patient Verification 🔧 Stub
+### 6. Patient Verification ✅ Live
 
-*Used standalone and as a sub-workflow for flows 7–10.*
+*Used standalone and as a sub-workflow for flows 7–9 and 11.*
 
-**Trigger phrases:** "I'm an existing patient", "I need to book an appointment"
+**Trigger phrases:** "I'm an existing patient", "I've been here before"
 
 **Fields collected:**
 
-| Field | Example |
-|-------|---------|
-| Last name | "Thompson" |
-| Date of birth | "1985-03-14" |
+| Field | Required? | Example |
+|-------|-----------|---------|
+| Last name | Required | "Thompson" |
+| Date of birth | Required | "March 14 1985" |
+| First name | Optional | "Alice" — used for disambiguation only |
+| Phone number | Optional | "(416) 555-0201" — boosts match confidence to 1.0 |
 
-**Optional fields:** phone number (raises match confidence), first name
+**Confidence levels:**
+
+| Scenario | `match_confidence` |
+|----------|--------------------|
+| Phone-only match | 0.8 |
+| Last name + DOB match | 0.7 |
+| Last name + DOB + phone match | 1.0 |
+| Last name + DOB + first name disambiguation | 0.9 |
 
 **Flow:**
-1. Chatbot asks for last name + DOB.
-2. `lookup_patient` called — returns `found: true/false` + patient record.
-3. On success: resumes pending parent workflow (book / reschedule / cancel).
-4. On failure: offers new-patient registration.
+```
+User: "existing patient" (or any booking intent without patient_id)
+    │
+    ▼
+Ask: "Could you tell me your last name and date of birth?"
+    │
+    ▼  fields collected
+lookup_patient
+    │
+    ├─ found (conf ≥ 0.7) ──────────────► set patient_id → resume pending workflow
+    │
+    ├─ multiple_matches ────────────────► "Found more than one patient with that
+    │                                      name and date of birth. Could you also
+    │  user replies with first name        share your first name?"
+    │       │                              step = "disambiguating"
+    │       ▼
+    │  retry lookup_patient (with first_name)
+    │       │
+    │       └─ resolved ────────────────► resume pending workflow
+    │       └─ still ambiguous ─────────► "Please call (416) 555-0100"
+    │
+    ├─ low confidence (phone match       ► "I found a record for that number
+    │  but name mismatch, conf < 0.7)      but couldn't fully verify it.
+    │                                      Could you confirm your last name
+    │  user replies with name + DOB        and date of birth?"
+    │       │                              step = "reconfirming"
+    │       ▼
+    │  retry lookup_patient
+    │
+    └─ not found ───────────────────────► clear name fields, offer retry
+           │  (_lookup_retry = True)       or new-patient registration
+           └─ still not found ──────────► "I still wasn't able to match…
+                                           Please call us or register as new"
+```
 
 **Tool:** `lookup_patient`
 
 ---
 
-### 7. Book Appointment 🔧 Stub
+### 7. Existing Patient Appointment Booking ✅ Live
 
-**Trigger phrases:** "I want to book a cleaning", "Schedule an appointment", "Can I come in next week?"
+**Trigger phrases:** "I want to book a cleaning", "Schedule an appointment", "Can I come in next week?", "I need a check-up"
 
-**Requires:** patient identity (auto-runs flow 6 first if not verified)
+**Requires:** patient identity — state machine automatically runs flow 6 first if `patient_id` is absent.
 
-**Fields collected:**
+**Fields collected (after verification):**
 
 | Field | Example |
 |-------|---------|
 | Appointment type | "cleaning", "general checkup", "emergency" |
 | Preferred date | "next Monday", "April 15th" |
 
-**Optional fields:** preferred time of day (morning / afternoon / after school)
+**Optional fields:** preferred time of day (morning / afternoon / any)
 
 **Flow:**
-1. Verify patient identity (sub-workflow 6).
-2. Ask for appointment type + preferred date.
-3. `search_slots` returns up to 5 available slots.
-4. Patient selects a slot → `book_appointment` called.
-5. Confirmation with date, time, and provider name.
-
-**Tools:** `lookup_patient` → `search_slots` → `book_appointment`
+```
+User: "I want to book a cleaning next week"
+    │
+    ├─ patient_id present ──────────────────────────┐
+    │                                               │
+    └─ no patient_id ──► run flow 6 (verification)  │
+           │  verified                              │
+           └────────────────────────────────────────┘
+                │
+                ▼
+    Collect: appointment type + preferred date
+                │
+                ▼  all fields collected
+    search_slots (date window: requested date + 14 days)
+                │
+                ├─ No slots → ask for different date / time of day
+                │
+                ▼  slots found
+    Present up to 3 options (same UI as flow 5)
+                │
+                ▼  user selects
+    book_appointment ──► confirmation
+```
 
 **Appointment types supported:**
 
-| Code | Shown as |
-|------|----------|
-| `cleaning` | Teeth Cleaning |
-| `general_checkup` | General Check-up |
-| `new_patient_exam` | New Patient Exam |
-| `emergency` | Emergency Visit (→ triggers flow 10) |
+| Code | Shown as | Note |
+|------|----------|------|
+| `cleaning` | Teeth Cleaning | |
+| `general_checkup` | General Check-up | |
+| `new_patient_exam` | New Patient Exam | |
+| `emergency` | Emergency Visit | Triggers flow 10 (staff notification) |
+
+**Tools called:** `lookup_patient` (if unverified) → `search_slots` → `book_appointment`
+
+**Re-used helpers:** `_search_and_present_slots`, `_handle_slot_selection` — identical to flow 5
 
 ---
 
@@ -330,11 +428,26 @@ first match:
 | Tool | Called by flow(s) | Status |
 |------|-------------------|--------|
 | `get_clinic_info` | 1 · 2 · 3 · 4 | ✅ Live |
-| `lookup_patient` | 6 · 7 · 8 · 9 · 11 | 🔧 Stub |
-| `create_patient` | 5 | 🔧 Stub |
-| `search_slots` | 5 · 7 · 8 · 10 | 🔧 Stub |
-| `book_appointment` | 5 · 7 · 10 | 🔧 Stub |
+| `lookup_patient` | 6 · 7 · 8 · 9 · 11 | ✅ Live |
+| `create_patient` | 5 | ✅ Live |
+| `search_slots` | 5 · 7 · 8 · 10 | ✅ Live |
+| `book_appointment` | 5 · 7 · 10 | ✅ Live |
 | `reschedule_appointment` | 8 | 🔧 Stub |
 | `cancel_appointment` | 9 | 🔧 Stub |
 | `book_family_appointments` | 11 | 🔧 Stub |
 | `create_staff_notification` | 10 · 12 | 🔧 Stub |
+
+---
+
+## Shared helpers (code reuse)
+
+Both flows 5 and 7 share the same slot-selection pipeline — no duplicated logic:
+
+| Helper | Location | Used by |
+|--------|----------|---------|
+| `_search_and_present_slots` | `routers/chat.py` | Flows 5 and 7 (and 8/10 when implemented) |
+| `_handle_slot_selection` | `routers/chat.py` | Flows 5 and 7 — parses "1" / "first" / "option 2" → `book_appointment` |
+| `_resume_pending_workflow` | `routers/chat.py` | Flow 6 — resumes whichever workflow triggered verification |
+| `_apply_verification_retry` | `routers/chat.py` | Flow 6 — handles disambiguation and re-confirm retry turns |
+| `normalize_appointment_type` | `tools/validators.py` | Flows 5 and 7 — maps free text to canonical codes |
+| `normalize_phone` | `tools/validators.py` | Flow 5 — validates and normalises phone before `create_patient` |

@@ -27,6 +27,7 @@ from state_machine.extractors import (
     extract_cancel_reason,
     extract_confirmation,
     extract_dob,
+    extract_email,
     extract_emergency_summary,
     extract_family_count,
     extract_full_name,
@@ -139,6 +140,13 @@ FIELDS: dict[str, FieldDef] = {
         prompt="How many people need appointments in total?",
         extractor=extract_family_count,
     ),
+    "email": FieldDef(
+        key="email",
+        display_name="email address",
+        prompt="Could you share your email address so I can find your exact record?",
+        extractor=extract_email,
+        optional=True,
+    ),
     "confirmation": FieldDef(
         key="confirmation",
         display_name="confirmation",
@@ -225,18 +233,21 @@ WORKFLOWS: dict[Workflow, WorkflowDef] = {
     ),
     # ------------------------------------------------------------------
     # Existing patient verification
-    # Collect: last_name + DOB (+ optionally phone for higher confidence)
+    # Collect: first_name + last_name (via multi_key full-name extractor) + phone_number
+    # first_name prompt asks for full name → populates both first_name and last_name.
+    # phone_number may already be pre-filled from caller ID, so often only one question needed.
+    # email is optional — only asked if two records share the same name + phone (edge case).
     # Tool: lookup_patient
     # ------------------------------------------------------------------
     Workflow.EXISTING_PATIENT_VERIFICATION: WorkflowDef(
         workflow=Workflow.EXISTING_PATIENT_VERIFICATION,
         display_name="Patient Verification",
-        required_fields=["last_name", "date_of_birth"],
-        optional_fields=["phone_number", "first_name"],
+        required_fields=["first_name", "last_name", "phone_number"],
+        optional_fields=["email"],
         tool_name="lookup_patient",
         greeting=(
             "Hey, this is Maya from Bright Smile Dental - sorry we missed your call! "
-            "To pull up your file, could you tell me your last name and date of birth?"
+            "To pull up your file, could you tell me your full name and phone number?"
         ),
         ready_message="Thanks — let me look you up in our system.",
     ),

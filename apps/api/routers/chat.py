@@ -85,29 +85,38 @@ async def post_chat(
         if pid:
             current_state = current_state.model_copy(update={"patient_id": pid})
 
+    # --- slot selection turn (user chose from presented options) ---
+    if current_state.step == "selecting_slot" and current_state.slot_options:
+        return _handle_slot_selection(body.message, current_state, db, practice_id, caller_context)
+
+    # --- disambiguation retry: two records matched → user replied with email ---
+    if current_state.step == "disambiguating":
+        current_state = _apply_verification_retry(current_state, body.message)
+
     # --- run the state machine ---
     result = _run_machine(current_state, body.message)
 
     reply = result.reply
+    updated_state = result.state
+    tools_called: list[str] = []
 
     # --- attempt tool call if machine says it's ready ---
     if result.ready_to_call and result.tool_name:
-        tool_reply = _call_tool(
-            result.tool_name,
-            result.tool_input_data,
-            db,
+        reply, updated_state, tools_called = _dispatch_tool(
+            tool_name=result.tool_name,
+            tool_input_data=result.tool_input_data,
+            state=updated_state,
+            db=db,
             original_message=body.message,
             is_first_message=is_first_turn,
             practice_id=practice_id,
         )
-        if tool_reply:
-            reply = tool_reply
 
     return ChatResponse(
         reply=reply,
-        state=result.state,
+        state=updated_state,
         actions=result.actions,
-        tools_called=[result.tool_name] if (result.ready_to_call and result.tool_name) else [],
+        tools_called=tools_called,
         caller_context=caller_context,
     )
 
@@ -137,163 +146,421 @@ async def chat_status(
 # ---------------------------------------------------------------------------
 
 
+def _apply_verification_retry(state: WorkflowState, message: str) -> WorkflowState:
+    """
+    Called when step == 'disambiguating' (two records matched name+phone).
+    Extract the email from the user's reply and reset step to 'collecting' so
+    the state machine sees all required fields present and fires lookup_patient again.
+    """
+    from state_machine.extractors import extract_email
+
+    collected = dict(state.collected_fields)
+    if "email" not in collected:
+        email = extract_email(message)
+        if email:
+            collected["email"] = email
+
+    return state.model_copy(
+        update={
+            "step": "collecting",
+            "collected_fields": collected,
+            "missing_fields": [],
+        }
+    )
+
+
 def _run_machine(state: WorkflowState, message: str):
     """Run the state machine and return a MachineResult."""
     return WorkflowStateMachine(state).process(message)
 
 
 # ---------------------------------------------------------------------------
-# Tool dispatcher (calls stub functions; logs graceful fallback on NotImplementedError)
+# Multi-step tool dispatcher
+# Returns (reply, updated_state, tools_called)
 # ---------------------------------------------------------------------------
 
 
-def _call_tool(
+def _dispatch_tool(
     tool_name: str,
-    data: dict,
+    tool_input_data: dict,
+    state: WorkflowState,
     db: Session,
     original_message: str = "",
     is_first_message: bool = False,
     practice_id: str = "",
-) -> str | None:
+) -> tuple[str, WorkflowState, list[str]]:
     """
-    Call the named tool.  Returns a human-readable string to use as the
-    chatbot reply, or None if the tool is not yet implemented / failed.
+    Call the appropriate tool and return (reply, updated_state, tools_called).
 
-    For get_clinic_info the raw DB result is passed through the Gemini-powered
-    receptionist to generate a warm, natural-language answer.
+    NEW PATIENT BOOKING multi-step:
+      create_patient → auto search_slots → present options → user picks → book_appointment
     """
     try:
         match tool_name:
+
+            # ------------------------------------------------------------------
+            # General inquiry — DB + Gemini receptionist
+            # ------------------------------------------------------------------
             case "get_clinic_info":
                 from schemas.tools import GetClinicInfoInput
                 from tools.clinic_tools import get_clinic_info, get_pricing_options
 
-                # Determine the best category to query based on the user's message
                 category = _infer_clinic_category(original_message)
                 result = get_clinic_info(
                     db,
                     GetClinicInfoInput(category=category, question_hint=original_message),
                     practice_id=practice_id,
                 )
-
-                # Fetch pricing options for payment/insurance/no-insurance questions
                 pricing: list = []
                 if category in ("payment", "insurance") or _is_payment_question(original_message):
                     pricing = get_pricing_options(db, practice_id=practice_id)
 
                 from llm.receptionist import answer_general_inquiry
 
-                return answer_general_inquiry(original_message, result, pricing or None, is_first_message=is_first_message)
+                reply = answer_general_inquiry(
+                    original_message, result, pricing or None, is_first_message=is_first_message
+                )
+                return reply, state, ["get_clinic_info"]
 
+            # ------------------------------------------------------------------
+            # Patient lookup (existing-patient verification)
+            # Lookup key: first_name + last_name + phone  (should be unique).
+            # Edge case: two records share all three → ask for email once.
+            # ------------------------------------------------------------------
             case "lookup_patient":
                 from schemas.tools import LookupPatientInput
                 from tools.patient_tools import lookup_patient
 
-                lookup_fields = ["phone_number", "last_name", "date_of_birth"]
+                lookup_fields = ["first_name", "last_name", "phone_number", "email"]
                 result = lookup_patient(
                     db,
-                    LookupPatientInput(**_safe_input(data, lookup_fields)),
+                    LookupPatientInput(**_safe_input(tool_input_data, lookup_fields)),
                     practice_id=practice_id,
                 )
-                if result.found and result.patient:
-                    return f"I found your record — welcome back, {result.patient.first_name}!"
-                return (
-                    "I wasn't able to find a matching record. "
-                    "Please double-check your details or register as a new patient."
-                )
 
+                # ── Verified ─────────────────────────────────────────────────
+                if result.found and result.patient:
+                    p = result.patient
+                    verified_state = state.model_copy(update={"patient_id": p.id})
+                    return _resume_pending_workflow(verified_state, db, p.first_name, tool_input_data)
+
+                # ── Duplicate records — ask for email as tiebreaker ──────────
+                if result.multiple_matches:
+                    # Don't clear other fields; next turn's _apply_verification_retry
+                    # will extract email and retry lookup automatically.
+                    new_state = state.model_copy(
+                        update={
+                            "step": "disambiguating",
+                            "collected_fields": {**state.collected_fields, "_lookup_retry": True},
+                        }
+                    )
+                    return (
+                        "I found more than one record matching that name and number. "
+                        "Could you share your email address so I can find the right file?",
+                        new_state,
+                        ["lookup_patient"],
+                    )
+
+                # ── Not found ────────────────────────────────────────────────
+                was_retry = state.collected_fields.get("_lookup_retry", False)
+                not_found_msg = (
+                    "I still wasn't able to match those details to a patient record. "
+                    "Please call (416) 555-0100 and we can sort it out, "
+                    "or would you like to register as a new patient?"
+                    if was_retry else
+                    "I wasn't able to find a record with that name and number. "
+                    "Could you double-check, or would you like to register as a new patient?"
+                )
+                # Clear identity fields so the user can re-enter them
+                retry_state = state.model_copy(
+                    update={
+                        "step": "collecting",
+                        "collected_fields": {
+                            k: v
+                            for k, v in state.collected_fields.items()
+                            if not k.startswith("_")
+                            and k not in ("first_name", "last_name", "phone_number", "email")
+                        },
+                        "missing_fields": ["first_name", "last_name", "phone_number"],
+                    }
+                )
+                return not_found_msg, retry_state, ["lookup_patient"]
+
+            # ------------------------------------------------------------------
+            # New patient registration → immediately search slots on success
+            # ------------------------------------------------------------------
             case "create_patient":
                 from schemas.tools import CreatePatientInput
                 from tools.patient_tools import create_patient
 
-                result = create_patient(db, CreatePatientInput(**data), practice_id=practice_id)
-                if result.success and result.patient:
-                    return (
-                        f"You've been registered! Your patient ID is {result.patient.id}. "
-                        "Let me now find available slots."
-                    )
-                return f"Registration failed: {result.error}"
+                result = create_patient(db, CreatePatientInput(**tool_input_data), practice_id=practice_id)
+                if not result.success or not result.patient:
+                    return f"I couldn't register you: {result.error}", state, ["create_patient"]
 
-            case "search_slots":
-                from datetime import date as _date
-                from datetime import timedelta
-
-                from schemas.tools import SearchSlotsInput
-                from tools.scheduling_tools import search_slots
-
-                date_from = data.get("preferred_date_from") or _date.today()
-                date_to = date_from + timedelta(days=14)
-                result = search_slots(
-                    db,
-                    SearchSlotsInput(
-                        appointment_type_code=data.get("appointment_type", "cleaning"),
-                        date_from=date_from,
-                        date_to=date_to,
-                        preferred_time_of_day=data.get("preferred_time_of_day", "any"),
-                    ),
+                # Store patient_id, then immediately search slots
+                new_state = state.model_copy(update={"patient_id": result.patient.id})
+                reply, new_state, slot_tools = _search_and_present_slots(
+                    tool_input_data, new_state, db,
+                    preamble=f"Welcome {result.patient.first_name}! You're all registered."
                 )
-                if result.slots:
-                    slot_lines = "\n".join(
-                        f"  {i + 1}. {s.date_label} at {s.time_label}" for i, s in enumerate(result.slots[:5])
-                    )
-                    return f"Here are the next available slots:\n{slot_lines}\n\nWhich works best for you?"
-                return "No available slots found for that period. Would you like to try different dates?"
+                return reply, new_state, ["create_patient"] + slot_tools
 
-            case "book_appointment":
-                from schemas.tools import BookAppointmentInput
-                from tools.scheduling_tools import book_appointment
+            # ------------------------------------------------------------------
+            # Slot search (existing patient booking)
+            # ------------------------------------------------------------------
+            case "search_slots":
+                reply, new_state, tools = _search_and_present_slots(tool_input_data, state, db)
+                return reply, new_state, tools
 
-                result = book_appointment(db, BookAppointmentInput(**data))
-                if result.success and result.appointment:
-                    a = result.appointment
-                    provider = a.provider_display_name or "our team"
-                    return f"Booked! Your appointment is on {a.date_label} at {a.time_label} with {provider}."
-                return f"Booking failed: {result.error}"
-
-            case "reschedule_appointment":
-                from schemas.tools import RescheduleAppointmentInput
-                from tools.scheduling_tools import reschedule_appointment
-
-                result = reschedule_appointment(db, RescheduleAppointmentInput(**data))
-                if result.success and result.new_appointment:
-                    a = result.new_appointment
-                    return f"Rescheduled! Your new appointment is on {a.date_label} at {a.time_label}."
-                return f"Rescheduling failed: {result.error}"
-
-            case "cancel_appointment":
-                from schemas.tools import CancelAppointmentInput
-                from tools.scheduling_tools import cancel_appointment
-
-                result = cancel_appointment(db, CancelAppointmentInput(**data))
-                if result.success:
-                    return "Your appointment has been cancelled. We hope to see you again soon."
-                return f"Cancellation failed: {result.error}"
-
-            case "book_family_appointments":
-                from schemas.tools import BookFamilyAppointmentsInput
-                from tools.scheduling_tools import book_family_appointments
-
-                result = book_family_appointments(db, BookFamilyAppointmentsInput(**data))
-                if result.all_booked:
-                    return f"All {len(result.appointments)} appointments have been booked!"
-                failed = ", ".join(result.partial_failures)
-                return f"{len(result.appointments)} appointment(s) booked. Could not confirm: {failed}"
+            # ------------------------------------------------------------------
+            # Stubs for flows not yet implemented
+            # ------------------------------------------------------------------
+            case "reschedule_appointment" | "cancel_appointment" | "book_family_appointments":
+                return (
+                    "That feature is coming soon. Please call us at (416) 555-0100 and we will be happy to help.",
+                    state,
+                    [],
+                )
 
             case "create_staff_notification":
-                from schemas.tools import CreateStaffNotificationInput
-                from tools.notification_tools import create_staff_notification
-
-                result = create_staff_notification(db, CreateStaffNotificationInput(**data), practice_id=practice_id)
-                return None  # reply already set by machine (staff notified message)
+                return (
+                    "I've notified our team. A staff member will be in touch with you shortly.",
+                    state,
+                    ["create_staff_notification"],
+                )
 
             case _:
-                return None
+                return state.workflow + " — coming soon.", state, []
 
     except NotImplementedError:
-        # Tool stub not yet implemented — silently continue with machine's reply
-        return None
-    except Exception:
-        return None
+        return (
+            "That feature is not yet available. Please call us at (416) 555-0100.",
+            state,
+            [],
+        )
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).exception("Tool dispatch error: %s", exc)
+        return (
+            "Something went wrong on our end. Please try again or call us at (416) 555-0100.",
+            state,
+            [],
+        )
+
+
+# ---------------------------------------------------------------------------
+# Post-verification router — resumes the workflow that triggered verification
+# ---------------------------------------------------------------------------
+
+
+def _resume_pending_workflow(
+    state: WorkflowState,
+    db: Session,
+    first_name: str,
+    tool_input_data: dict,
+) -> tuple[str, WorkflowState, list[str]]:
+    """
+    After a successful patient lookup, resume the workflow that was pending.
+
+    Possible pending workflows:
+      - book_appointment  → search slots for the verified patient
+      - reschedule_appointment → (stub for now)
+      - cancel_appointment     → (stub for now)
+      - None / general     → generic welcome-back reply
+    """
+    pending = state.collected_fields.get("_pending_workflow", "")
+
+    if pending == "book_appointment":
+        reply, new_state, tools = _search_and_present_slots(
+            tool_input_data,
+            state,
+            db,
+            preamble=f"Got it, welcome back {first_name}!",
+        )
+        return reply, new_state, ["lookup_patient"] + tools
+
+    if pending in ("reschedule_appointment", "cancel_appointment"):
+        return (
+            f"Welcome back {first_name}! That feature is coming soon — "
+            "please call us at (416) 555-0100 and we'll be happy to help.",
+            state,
+            ["lookup_patient"],
+        )
+
+    # Verified but no specific pending workflow (standalone verification)
+    return (
+        f"Got it, welcome back {first_name}! How can I help you today?",
+        state,
+        ["lookup_patient"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Slot search helper — used by create_patient and search_slots branches
+# ---------------------------------------------------------------------------
+
+
+def _search_and_present_slots(
+    data: dict,
+    state: WorkflowState,
+    db: Session,
+    preamble: str = "",
+) -> tuple[str, WorkflowState, list[str]]:
+    """
+    Run search_slots, format options 1-3, set state.step='selecting_slot'.
+    Returns (reply, updated_state, tools_called).
+    """
+    from datetime import date as _date, timedelta
+    from schemas.tools import SearchSlotsInput
+    from tools.scheduling_tools import search_slots
+    from tools.validators import normalize_appointment_type
+
+    raw_type = data.get("appointment_type") or data.get("appointment_type_code") or "cleaning"
+    try:
+        appt_code = normalize_appointment_type(str(raw_type))
+    except ValueError:
+        appt_code = "cleaning"
+
+    date_from = data.get("preferred_date_from") or _date.today() + timedelta(days=1)
+    if isinstance(date_from, str):
+        try:
+            from datetime import date as _d
+            date_from = _d.fromisoformat(date_from)
+        except ValueError:
+            date_from = _date.today() + timedelta(days=1)
+
+    date_to = date_from + timedelta(days=14)
+
+    result = search_slots(
+        db,
+        SearchSlotsInput(
+            appointment_type_code=appt_code,
+            date_from=date_from,
+            date_to=date_to,
+            preferred_time_of_day=data.get("preferred_time_of_day") or "any",
+        ),
+    )
+
+    if not result.slots:
+        reply = (
+            f"{preamble}\n\n" if preamble else ""
+        ) + (
+            "I couldn't find any available slots in that period. "
+            "Would you like to try a different date or time of day?"
+        )
+        return reply.strip(), state, ["search_slots"]
+
+    options = result.slots[:3]
+    slot_options = [{"id": s.id, "label": f"{s.date_label}, {s.time_label}"} for s in options]
+    lines = "\n".join(f"{i + 1}. {s.date_label}, {s.time_label}" for i, s in enumerate(options))
+
+    reply = (f"{preamble}\n\n" if preamble else "") + (
+        f"Here are the next available slots for your {options[0].appointment_type_display}:\n\n"
+        f"{lines}\n\n"
+        "Which one works best for you? Reply with 1, 2, or 3."
+    )
+
+    new_state = state.model_copy(update={"step": "selecting_slot", "slot_options": slot_options})
+    return reply.strip(), new_state, ["search_slots"]
+
+
+# ---------------------------------------------------------------------------
+# Slot selection handler — called when step == 'selecting_slot'
+# ---------------------------------------------------------------------------
+
+
+def _handle_slot_selection(
+    message: str,
+    state: WorkflowState,
+    db: Session,
+    practice_id: str,
+    caller_context: CallerContext | None,
+) -> ChatResponse:
+    """
+    Parse the user's slot choice, book it, return confirmation.
+    """
+    from schemas.tools import BookAppointmentInput
+    from state_machine.extractors import extract_slot_choice
+    from tools.scheduling_tools import book_appointment
+    from tools.validators import normalize_appointment_type
+
+    choice = extract_slot_choice(message)
+
+    if choice is None or choice < 1 or choice > len(state.slot_options):
+        available = len(state.slot_options)
+        return ChatResponse(
+            reply=f"Please reply with a number between 1 and {available} to choose a slot.",
+            state=state,
+            caller_context=caller_context,
+        )
+
+    chosen = state.slot_options[choice - 1]
+    slot_id = chosen["id"]
+
+    raw_type = state.collected_fields.get("appointment_type") or "cleaning"
+    try:
+        appt_code = normalize_appointment_type(str(raw_type))
+    except ValueError:
+        appt_code = "cleaning"
+
+    result = book_appointment(
+        db,
+        BookAppointmentInput(
+            patient_id=state.patient_id,
+            slot_id=slot_id,
+            appointment_type_code=appt_code,
+            booked_via="chatbot",
+        ),
+    )
+
+    if not result.success or not result.appointment:
+        # Slot was taken — re-present remaining options
+        remaining = [o for i, o in enumerate(state.slot_options) if i + 1 != choice]
+        if remaining:
+            lines = "\n".join(f"{i + 1}. {o['label']}" for i, o in enumerate(remaining))
+            new_state = state.model_copy(update={"slot_options": remaining})
+            return ChatResponse(
+                reply=(
+                    f"Sorry, that slot just got taken. Here are the remaining options:\n\n{lines}\n\n"
+                    "Reply with 1 or 2 to choose."
+                ),
+                state=new_state,
+                caller_context=caller_context,
+            )
+        return ChatResponse(
+            reply=(
+                "That slot is no longer available and I'm out of options for that window. "
+                "Want me to search a different date or time?"
+            ),
+            state=state.model_copy(update={"step": "collecting", "slot_options": []}),
+            caller_context=caller_context,
+        )
+
+    a = result.appointment
+    provider = f" with {a.provider_display_name}" if a.provider_display_name else ""
+    confirm_reply = (
+        f"You're all set! Your {a.appointment_type_display} is confirmed:\n\n"
+        f"Date: {a.date_label}\n"
+        f"Time: {a.time_label}{provider}\n"
+        f"Location: {a.location_name}\n\n"
+        "We'll see you then! Reply anytime if you need to make changes. - Maya"
+    )
+
+    new_state = state.model_copy(
+        update={
+            "step": "confirmed",
+            "appointment_id": a.id,
+            "slot_options": [],
+            "selected_slot_id": slot_id,
+        }
+    )
+    return ChatResponse(
+        reply=confirm_reply,
+        state=new_state,
+        actions=[],
+        tools_called=["book_appointment"],
+        caller_context=caller_context,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +602,7 @@ def _caller_lookup(db: Session, phone: str, practice_id: str) -> tuple[CallerCon
     from schemas.tools import LookupPatientInput
     from tools.patient_tools import lookup_patient
 
+    # Phone-only call — relies on the 0.8-confidence strategy in lookup_patient.
     lo = lookup_patient(db, LookupPatientInput(phone_number=phone), practice_id)
     if lo.found and lo.patient:
         p = lo.patient

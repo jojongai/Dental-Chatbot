@@ -179,36 +179,45 @@ class TestNewPatientRegistration:
 
 
 class TestExistingPatientVerification:
-    def test_required_fields_are_last_name_and_dob(self):
+    def test_required_fields_are_name_and_phone(self):
+        """Verification now uses first_name + last_name + phone_number as the lookup key."""
         wf = WORKFLOWS[Workflow.EXISTING_PATIENT_VERIFICATION]
+        assert "first_name" in wf.required_fields
         assert "last_name" in wf.required_fields
-        assert "date_of_birth" in wf.required_fields
+        assert "phone_number" in wf.required_fields
+        assert "date_of_birth" not in wf.required_fields  # no longer required
 
-    def test_missing_both_fields_initially(self):
+    def test_missing_fields_initially(self):
         state = make_state(workflow=Workflow.EXISTING_PATIENT_VERIFICATION, step="collecting")
         result = run(state, "I want to check in")
-        assert "last_name" in result.state.missing_fields or len(result.state.missing_fields) > 0
+        assert len(result.state.missing_fields) > 0
         assert result.ready_to_call is False
 
-    def test_extracts_last_name(self):
+    def test_extracts_full_name(self):
+        """Full-name extractor populates both first_name and last_name."""
         state = make_state(workflow=Workflow.EXISTING_PATIENT_VERIFICATION, step="collecting")
-        result = run(state, "My last name is Thompson")
+        result = run(state, "My name is Alice Thompson")
+        assert result.state.collected_fields.get("first_name") == "Alice"
         assert result.state.collected_fields.get("last_name") == "Thompson"
 
-    def test_extracts_dob(self):
+    def test_extracts_phone(self):
         state = make_state(
             workflow=Workflow.EXISTING_PATIENT_VERIFICATION,
             step="collecting",
-            collected_fields={"last_name": "Thompson"},
+            collected_fields={"first_name": "Alice", "last_name": "Thompson"},
         )
-        result = run(state, "1985-03-14")
-        assert result.state.collected_fields.get("date_of_birth") == date(1985, 3, 14)
+        result = run(state, "My number is (416) 555-0201")
+        assert result.state.collected_fields.get("phone_number") == "(416) 555-0201"
 
-    def test_ready_when_last_name_and_dob_present(self):
+    def test_ready_when_all_three_present(self):
         state = make_state(
             workflow=Workflow.EXISTING_PATIENT_VERIFICATION,
             step="collecting",
-            collected_fields={"last_name": "Thompson", "date_of_birth": date(1985, 3, 14)},
+            collected_fields={
+                "first_name": "Alice",
+                "last_name": "Thompson",
+                "phone_number": "(416) 555-0201",
+            },
         )
         result = run(state, "that's right")
         assert result.ready_to_call is True
@@ -218,10 +227,16 @@ class TestExistingPatientVerification:
         state = make_state(
             workflow=Workflow.EXISTING_PATIENT_VERIFICATION,
             step="collecting",
-            collected_fields={"last_name": "Thompson", "date_of_birth": date(1985, 3, 14)},
+            collected_fields={
+                "first_name": "Alice",
+                "last_name": "Thompson",
+                "phone_number": "(416) 555-0201",
+            },
         )
         result = run(state, "yes")
+        assert result.tool_input_data.get("first_name") == "Alice"
         assert result.tool_input_data.get("last_name") == "Thompson"
+        assert result.tool_input_data.get("phone_number") == "(416) 555-0201"
 
 
 # ---------------------------------------------------------------------------
@@ -449,7 +464,11 @@ class TestMachineStatus:
         state = make_state(
             workflow=Workflow.EXISTING_PATIENT_VERIFICATION,
             step="collecting",
-            collected_fields={"last_name": "Smith", "date_of_birth": date(1985, 5, 10)},
+            collected_fields={
+                "first_name": "Alice",
+                "last_name": "Smith",
+                "phone_number": "(416) 555-0201",
+            },
         )
         status = machine_status(state)
         assert status["ready_to_call_tool"] is True

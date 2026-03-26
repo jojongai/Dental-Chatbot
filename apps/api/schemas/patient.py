@@ -14,12 +14,16 @@ from pydantic import BaseModel, Field
 
 class PatientLookupIn(BaseModel):
     """
-    At least one of (phone_number) or (last_name + date_of_birth) must be supplied.
-    Used by the existing-patient verification workflow.
+    Primary key: first_name + last_name + phone_number (should be unique in practice).
+    Falls back to phone-only (confidence 0.8) or name-only (confidence 0.7).
+    email is only used as a last-resort tiebreaker if two records share all three primary fields.
+    date_of_birth is kept for backwards-compat but no longer required.
     """
 
-    phone_number: str | None = Field(None, examples=["(416) 555-2001"])
+    first_name: str | None = Field(None, examples=["Alice"])
     last_name: str | None = Field(None, examples=["Thompson"])
+    phone_number: str | None = Field(None, examples=["(416) 555-2001"])
+    email: str | None = Field(None, examples=["alice@example.com"])
     date_of_birth: date | None = Field(None, examples=["1985-03-14"])
 
 
