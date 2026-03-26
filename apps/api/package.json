@@ -1,0 +1,10 @@
+{
+  "name": "@dental-chatbot/api",
+  "private": true,
+  "scripts": {
+    "dev": "bash scripts/dev.sh",
+    "build": "echo 'Python API has no separate build step.'",
+    "lint": "bash scripts/lint.sh",
+    "test": "bash scripts/test.sh"
+  }
+}

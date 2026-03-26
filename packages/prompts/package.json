@@ -1,0 +1,13 @@
+{
+  "name": "@dental-chatbot/prompts",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "build": "echo 'Prompts are static assets; no build step.'",
+    "lint": "prettier --check .",
+    "test": "echo 'No tests yet'"
+  },
+  "devDependencies": {
+    "prettier": "^3.5.3"
+  }
+}
