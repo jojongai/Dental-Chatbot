@@ -11,7 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from models.content import ClinicSettings, FaqEntry, PricingOption
-from models.practice import Location, LocationHours
+from models.practice import Location, LocationHours, Practice
 from schemas.tools import (
     ClinicSettingsOut,
     FaqEntryOut,
@@ -30,6 +30,16 @@ _CATEGORY_ALIASES: dict[str, list[str]] = {
 
 # Day-of-week labels (0 = Sunday, matching LocationHours.day_of_week)
 _DOW = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+
+
+def get_practice_display_name(db: Session, practice_id: str) -> str:
+    """Display name for SMS / Maya intros (falls back if practice missing)."""
+    if not practice_id:
+        return "Bright Smile Dental"
+    row = db.get(Practice, practice_id)
+    if row:
+        return row.display_name or row.name
+    return "Bright Smile Dental"
 
 
 def get_clinic_info(

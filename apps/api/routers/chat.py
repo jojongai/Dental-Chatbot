@@ -18,10 +18,22 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from database import get_db
-from schemas.chat import ChatRequest, ChatResponse, WorkflowState
+from schemas.chat import (
+    CallerContext,
+    CallerStatus,
+    ChatRequest,
+    ChatResponse,
+    WorkflowState,
+)
 from state_machine.machine import WorkflowStateMachine, machine_status
 
 router = APIRouter(prefix="/chat", tags=["chat"])
+
+# First outbound SMS after a missed call (prototype — static copy only, no DB / lookup).
+OPENING_SMS_TEXT = (
+    "So sorry we missed your call. This is Maya from Bright Smile Dental. "
+    "Are you a new patient or an existing patient?"
+)
 
 
 @router.post("", response_model=ChatResponse, summary="Send a chat message")
@@ -42,16 +54,36 @@ async def post_chat(
 
     The `state` field in the response must be echoed back by the client on
     every subsequent request so the server can resume the workflow.
+
+    Session opening (`is_session_opening=true`): first outbound SMS after a missed
+    call — returns static `OPENING_SMS_TEXT` only (no DB, no caller lookup).
     """
+    practice_id = _default_practice_id(db)
+
+    # --- First SMS only: static opening line (prototype — no dynamic handling) ---
+    if body.is_session_opening:
+        return ChatResponse(
+            reply=OPENING_SMS_TEXT,
+            state=WorkflowState(),
+            caller_context=None,
+            tools_called=[],
+        )
+
     is_first_turn = body.state is None
     current_state = body.state or WorkflowState()
 
     # Pre-populate phone from caller ID so the bot never has to ask for it.
-    # The SMS gateway injects caller_phone on the first turn only.
     if body.caller_phone and "phone_number" not in current_state.collected_fields:
         current_state = current_state.model_copy(
             update={"collected_fields": {**current_state.collected_fields, "phone_number": body.caller_phone}}
         )
+
+    # Match caller_phone to a patient record once (before workflows that need patient_id).
+    caller_context: CallerContext | None = None
+    if body.caller_phone and not current_state.patient_id:
+        caller_context, pid = _caller_lookup(db, body.caller_phone, practice_id)
+        if pid:
+            current_state = current_state.model_copy(update={"patient_id": pid})
 
     # --- run the state machine ---
     result = _run_machine(current_state, body.message)
@@ -66,6 +98,7 @@ async def post_chat(
             db,
             original_message=body.message,
             is_first_message=is_first_turn,
+            practice_id=practice_id,
         )
         if tool_reply:
             reply = tool_reply
@@ -75,6 +108,7 @@ async def post_chat(
         state=result.state,
         actions=result.actions,
         tools_called=[result.tool_name] if (result.ready_to_call and result.tool_name) else [],
+        caller_context=caller_context,
     )
 
 
@@ -113,7 +147,14 @@ def _run_machine(state: WorkflowState, message: str):
 # ---------------------------------------------------------------------------
 
 
-def _call_tool(tool_name: str, data: dict, db: Session, original_message: str = "", is_first_message: bool = False) -> str | None:
+def _call_tool(
+    tool_name: str,
+    data: dict,
+    db: Session,
+    original_message: str = "",
+    is_first_message: bool = False,
+    practice_id: str = "",
+) -> str | None:
     """
     Call the named tool.  Returns a human-readable string to use as the
     chatbot reply, or None if the tool is not yet implemented / failed.
@@ -132,13 +173,13 @@ def _call_tool(tool_name: str, data: dict, db: Session, original_message: str = 
                 result = get_clinic_info(
                     db,
                     GetClinicInfoInput(category=category, question_hint=original_message),
-                    practice_id=_default_practice_id(db),
+                    practice_id=practice_id,
                 )
 
                 # Fetch pricing options for payment/insurance/no-insurance questions
                 pricing: list = []
                 if category in ("payment", "insurance") or _is_payment_question(original_message):
-                    pricing = get_pricing_options(db, practice_id=_default_practice_id(db))
+                    pricing = get_pricing_options(db, practice_id=practice_id)
 
                 from llm.receptionist import answer_general_inquiry
 
@@ -149,7 +190,11 @@ def _call_tool(tool_name: str, data: dict, db: Session, original_message: str = 
                 from tools.patient_tools import lookup_patient
 
                 lookup_fields = ["phone_number", "last_name", "date_of_birth"]
-                result = lookup_patient(db, LookupPatientInput(**_safe_input(data, lookup_fields)))
+                result = lookup_patient(
+                    db,
+                    LookupPatientInput(**_safe_input(data, lookup_fields)),
+                    practice_id=practice_id,
+                )
                 if result.found and result.patient:
                     return f"I found your record — welcome back, {result.patient.first_name}!"
                 return (
@@ -161,7 +206,7 @@ def _call_tool(tool_name: str, data: dict, db: Session, original_message: str = 
                 from schemas.tools import CreatePatientInput
                 from tools.patient_tools import create_patient
 
-                result = create_patient(db, CreatePatientInput(**data), practice_id="")
+                result = create_patient(db, CreatePatientInput(**data), practice_id=practice_id)
                 if result.success and result.patient:
                     return (
                         f"You've been registered! Your patient ID is {result.patient.id}. "
@@ -238,7 +283,7 @@ def _call_tool(tool_name: str, data: dict, db: Session, original_message: str = 
                 from schemas.tools import CreateStaffNotificationInput
                 from tools.notification_tools import create_staff_notification
 
-                result = create_staff_notification(db, CreateStaffNotificationInput(**data), practice_id="")
+                result = create_staff_notification(db, CreateStaffNotificationInput(**data), practice_id=practice_id)
                 return None  # reply already set by machine (staff notified message)
 
             case _:
@@ -280,6 +325,31 @@ def _is_payment_question(message: str) -> bool:
     payment_words = ["payment", "pay", "no insurance", "uninsured", "self pay", "self-pay", "financing", "membership", "afford", "cost", "price", "fee"]
     lower = message.lower()
     return any(w in lower for w in payment_words)
+
+
+def _caller_lookup(db: Session, phone: str, practice_id: str) -> tuple[CallerContext, str | None]:
+    """
+    Match caller ID to patients.phone_number (normalized). Used before booking flows.
+    Returns (CallerContext, patient_id or None).
+    """
+    from schemas.tools import LookupPatientInput
+    from tools.patient_tools import lookup_patient
+
+    lo = lookup_patient(db, LookupPatientInput(phone_number=phone), practice_id)
+    if lo.found and lo.patient:
+        p = lo.patient
+        return (
+            CallerContext(
+                status=CallerStatus.EXISTING,
+                patient_id=p.id,
+                first_name=p.first_name,
+                last_name=p.last_name,
+                is_existing_patient=p.is_existing_patient,
+                match_confidence=lo.match_confidence,
+            ),
+            p.id,
+        )
+    return (CallerContext(status=CallerStatus.UNKNOWN, match_confidence=0.0), None)
 
 
 def _default_practice_id(db: Session) -> str:
