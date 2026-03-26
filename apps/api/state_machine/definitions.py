@@ -63,94 +63,95 @@ FIELDS: dict[str, FieldDef] = {
     "first_name": FieldDef(
         key="first_name",
         display_name="first name",
-        prompt="Could I start with your full name?",
+        prompt="What's your full name?",
         extractor=extract_full_name,
         multi_key=True,  # also populates last_name
     ),
     "last_name": FieldDef(
         key="last_name",
         display_name="last name",
-        prompt="Could you tell me your last name?",
+        prompt="What's your last name?",
         extractor=extract_last_name,
     ),
     "phone_number": FieldDef(
         key="phone_number",
         display_name="phone number",
-        prompt="What's the best phone number to reach you at?",
+        prompt="What's a good number to reach you at?",
         extractor=extract_phone,
     ),
     "date_of_birth": FieldDef(
         key="date_of_birth",
         display_name="date of birth",
-        prompt="And your date of birth? (e.g. March 14, 1985)",
+        prompt="What's your date of birth? (like March 14, 1985)",
         extractor=extract_dob,
     ),
     "insurance_name": FieldDef(
         key="insurance_name",
         display_name="insurance provider",
-        prompt="Do you have dental insurance? If so, what's the name of your provider? "
-        "(It's okay if you don't — just say 'no insurance'.)",
+        prompt="Do you have dental insurance? If so, which provider? "
+        "No worries if you don't — just say 'no insurance'!",
         extractor=extract_insurance,
         optional=True,
     ),
     "appointment_type": FieldDef(
         key="appointment_type",
         display_name="appointment type",
-        prompt="What type of appointment would you like? "
-        "We offer: cleaning, general check-up, new patient exam, or emergency.",
+        prompt="What kind of appointment are you looking for? "
+        "We do cleanings, check-ups, new patient exams, and emergency visits.",
         extractor=extract_appointment_type,
     ),
     "preferred_date_from": FieldDef(
         key="preferred_date_from",
         display_name="preferred date",
-        prompt="What date or date range works best for you? (e.g. 'next week', 'April 5')",
+        prompt="When works best for you? (like 'next week', 'April 5', etc.)",
         extractor=extract_preferred_date,
     ),
     "preferred_time_of_day": FieldDef(
         key="preferred_time_of_day",
         display_name="preferred time of day",
-        prompt="Do you have a preference for morning, afternoon, or evening?",
+        prompt="Any preference on time of day — morning, afternoon, or evening?",
         extractor=extract_time_of_day,
         optional=True,
     ),
     "emergency_summary": FieldDef(
         key="emergency_summary",
         display_name="emergency description",
-        prompt="Please briefly describe what's happening — where is the pain, "
-        "how severe (1–10), and when did it start?",
+        prompt="Can you quickly describe what's going on? "
+        "Where's the pain, how bad on a scale of 1–10, and when did it start?",
         extractor=extract_emergency_summary,
     ),
     "cancel_reason": FieldDef(
         key="cancel_reason",
         display_name="reason for cancellation",
-        prompt="Could you let us know why you'd like to cancel? (e.g. schedule conflict, feeling better, etc.)",
+        prompt="Mind sharing why you need to cancel? (totally fine if it's just a scheduling thing)",
         extractor=extract_cancel_reason,
     ),
     "group_preference": FieldDef(
         key="group_preference",
         display_name="scheduling preference",
-        prompt="How would you like the appointments arranged? "
-        "Options: back-to-back, same day, same provider, or any (best available).",
+        prompt="How would you like to schedule everyone? "
+        "Back-to-back, same day, same provider, or just whatever's available?",
         extractor=extract_group_preference,
         optional=True,
     ),
     "family_count": FieldDef(
         key="family_count",
         display_name="number of family members",
-        prompt="How many people need appointments in total?",
+        prompt="How many people are we booking for?",
         extractor=extract_family_count,
     ),
     "email": FieldDef(
         key="email",
         display_name="email address",
-        prompt="Could you share your email address so I can find your exact record?",
+        prompt="I found a couple of records that match — "
+        "could you share your email so I can find the right one?",
         extractor=extract_email,
         optional=True,
     ),
     "confirmation": FieldDef(
         key="confirmation",
         display_name="confirmation",
-        prompt="Does that all look correct? (yes / no)",
+        prompt="Does everything look good? (just reply yes or no)",
         extractor=extract_confirmation,
     ),
 }
@@ -199,7 +200,7 @@ WORKFLOWS: dict[Workflow, WorkflowDef] = {
         required_fields=[],
         optional_fields=[],
         tool_name="get_clinic_info",
-        greeting="I can help with hours, location, insurance, or booking. What do you need?",
+        greeting="Of course! What can I help you with?",
     ),
     # ------------------------------------------------------------------
     # New patient registration
@@ -220,10 +221,8 @@ WORKFLOWS: dict[Workflow, WorkflowDef] = {
         optional_fields=["preferred_time_of_day"],
         tool_name="create_patient",
         requires_confirmation=True,
-        greeting="I can get you registered as a new patient right here. What is your full name?",
-        ready_message=(
-            "Great, I have everything I need to register you. Let me just confirm the details before we proceed."
-        ),
+        greeting="Great, I can get you set up right now! What's your full name?",
+        ready_message="Awesome, I've got everything I need. Just want to confirm before I go ahead:",
     ),
     # ------------------------------------------------------------------
     # Existing patient verification
@@ -239,8 +238,8 @@ WORKFLOWS: dict[Workflow, WorkflowDef] = {
         required_fields=["first_name", "last_name", "phone_number"],
         optional_fields=["email"],
         tool_name="lookup_patient",
-        greeting="To pull up your file, could you tell me your full name and phone number?",
-        ready_message="Thanks — let me look you up in our system.",
+        greeting="Sure! To find your file, what's your full name and phone number?",
+        ready_message="Perfect, give me one sec to look you up!",
     ),
     # ------------------------------------------------------------------
     # Book appointment (existing patient)
@@ -256,10 +255,10 @@ WORKFLOWS: dict[Workflow, WorkflowDef] = {
         tool_name="search_slots",
         requires_patient_id=True,
         greeting=(
-            "I can book an appointment for you. "
-            "What type do you need - cleaning, check-up, new patient exam, or emergency?"
+            "Happy to get that booked for you! "
+            "What kind of appointment are you looking for — cleaning, check-up, new patient exam, or is it urgent?"
         ),
-        ready_message="Let me search for available slots for you.",
+        ready_message="Let me check what's available for you...",
     ),
     # ------------------------------------------------------------------
     # Reschedule appointment
@@ -276,8 +275,8 @@ WORKFLOWS: dict[Workflow, WorkflowDef] = {
         optional_fields=["preferred_time_of_day"],
         tool_name="search_slots",
         requires_patient_id=True,
-        greeting="Sure, I can reschedule your appointment. Let me first pull up your file.",
-        ready_message="Let me find available slots for rescheduling.",
+        greeting="No problem, I can move that for you! Let me pull up your file first.",
+        ready_message="Let me see what other times are open for you...",
     ),
     # ------------------------------------------------------------------
     # Cancel appointment
@@ -293,8 +292,8 @@ WORKFLOWS: dict[Workflow, WorkflowDef] = {
         tool_name="cancel_appointment",
         requires_patient_id=True,
         requires_confirmation=True,
-        greeting="Sure, I can cancel your appointment. Let me first pull up your file.",
-        ready_message="Understood. Let me confirm the cancellation details.",
+        greeting="Got it, I can take care of that for you. Let me pull up your file first.",
+        ready_message="Just want to make sure I have the right appointment before I cancel it.",
     ),
     # ------------------------------------------------------------------
     # Family booking
@@ -310,8 +309,8 @@ WORKFLOWS: dict[Workflow, WorkflowDef] = {
         tool_name="book_family_appointments",
         requires_patient_id=True,
         requires_confirmation=True,
-        greeting="I can book for your whole family. How many people need appointments?",
-        ready_message=("Got it. I'll look for back-to-back slots for your family. Let me just confirm the details."),
+        greeting="Love it, I can get everyone booked! How many people are we looking at?",
+        ready_message="Nice! Let me just confirm what I've got before I go find some times:",
     ),
     # ------------------------------------------------------------------
     # Emergency triage
@@ -327,13 +326,13 @@ WORKFLOWS: dict[Workflow, WorkflowDef] = {
         tool_name="create_staff_notification",
         requires_confirmation=False,  # do NOT delay — notify staff immediately
         greeting=(
-            "I want to help right away. Please share your name and briefly describe "
-            "what is happening - location of pain, severity 1-10, and when it started."
+            "Oh no, I'm so sorry — we want to help right away. "
+            "Can you tell me your name and quickly describe what's going on? "
+            "Like where the pain is, how bad (1–10), and when it started?"
         ),
         ready_message=(
-            "Thank you. I've notified our dental team about your emergency "
-            "and they will be in touch with you shortly. "
-            "We'll do our best to see you as soon as possible today."
+            "I've just sent an alert to our team. "
+            "Someone will reach out to you very shortly — hang tight, we've got you."
         ),
     ),
     # ------------------------------------------------------------------
@@ -346,10 +345,8 @@ WORKFLOWS: dict[Workflow, WorkflowDef] = {
         required_fields=["phone_number"],
         optional_fields=["first_name"],
         tool_name="create_staff_notification",
-        greeting=(
-            "I'll have a team member call you back. What's your phone number?"
-        ),
-        ready_message=("I've let our team know. A staff member will call you back as soon as possible."),
+        greeting="Of course! What number should they call you back on?",
+        ready_message="Done! Someone from our team will give you a call back shortly.",
     ),
 }
 
