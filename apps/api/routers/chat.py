@@ -21,7 +21,9 @@ from database import get_db
 from schemas.chat import (
     ChatRequest,
     ChatResponse,
+    Workflow,
     WorkflowState,
+    workflow_state_for_new_conversation,
 )
 from state_machine.machine import WorkflowStateMachine, machine_status
 
@@ -29,9 +31,24 @@ router = APIRouter(prefix="/chat", tags=["chat"])
 
 # First outbound SMS after a missed call (prototype — static copy only, no DB / lookup).
 OPENING_SMS_TEXT = (
-    "So sorry we missed your call. This is Maya from Bright Smile Dental. "
-    "Are you a new patient or an existing patient?"
+    "So sorry we missed your call! This is Maya from Bright Smile Dental. "
+    "How can I help you today?"
 )
+
+
+def _is_first_substantive_turn(state: WorkflowState) -> bool:
+    """
+    True when the client has not yet advanced past the initial post-opening state:
+    general inquiry, step start, and only identity pre-fill (or empty collected_fields).
+    Used so the first user message after the opening SMS still gets receptionist
+    first-turn behaviour even though state is non-null.
+    """
+    from schemas.chat import IDENTITY_FIELD_KEYS
+
+    if state.workflow != Workflow.GENERAL_INQUIRY or state.step != "start":
+        return False
+    cf = state.collected_fields or {}
+    return all(k in IDENTITY_FIELD_KEYS for k in cf)
 
 
 @router.post("", response_model=ChatResponse, summary="Send a chat message")
@@ -66,8 +83,13 @@ async def post_chat(
             tools_called=[],
         )
 
-    is_first_turn = body.state is None
     current_state = body.state or WorkflowState()
+    if body.new_conversation:
+        current_state = workflow_state_for_new_conversation(body.state)
+
+    # First "real" user turn for receptionist copy: after opening, state is often
+    # empty GENERAL_INQUIRY/start — still the patient's first substantive message.
+    is_first_turn = body.state is None or _is_first_substantive_turn(current_state)
 
     # --- appointment selection turn (reschedule/cancel: patient picks which appointment) ---
     if current_state.step == "selecting_appointment" and current_state.appointment_options:
@@ -335,20 +357,14 @@ def _dispatch_tool(
                 return reply, new_state, ["cancel_appointment"]
 
             # ------------------------------------------------------------------
-            # Family booking stub
+            # Family booking
             # ------------------------------------------------------------------
             case "book_family_appointments":
-                return (
-                    "Family booking is coming soon. Please call us at (416) 555-0100 and we will be happy to help.",
-                    state,
-                    [],
-                )
+                return _dispatch_family_booking(tool_input_data, state, db, practice_id)
 
             case "create_staff_notification":
-                return (
-                    "I've notified our team. A staff member will be in touch with you shortly.",
-                    state,
-                    ["create_staff_notification"],
+                return _dispatch_emergency_notification(
+                    tool_input_data, state, db, practice_id
                 )
 
             case _:
@@ -404,6 +420,17 @@ def _resume_pending_workflow(
     if pending in ("reschedule_appointment", "cancel_appointment"):
         reply, new_state = _list_and_present_appointments(state, db, first_name)
         return reply, new_state, ["lookup_patient", "list_patient_appointments"]
+
+    if pending == "family_booking":
+        # Resume family booking workflow — prompt for appointment type/date now that we have patient_id
+        new_state = state.model_copy(update={"workflow": "family_booking", "step": "collecting"})
+        return (
+            f"Got it, welcome back {first_name}! "
+            "Now let's get everyone booked. What type of appointment does each person need — "
+            "cleaning, check-up, or something else?",
+            new_state,
+            ["lookup_patient"],
+        )
 
     # Verified but no specific pending workflow (standalone verification)
     return (
@@ -791,3 +818,253 @@ def _default_practice_id(db: Session) -> str:
 def _safe_input(data: dict, keys: list[str]) -> dict:
     """Return only the specified keys from data (for building tool inputs)."""
     return {k: v for k, v in data.items() if k in keys and v is not None}
+
+
+# ---------------------------------------------------------------------------
+# Emergency notification dispatch + urgent slot search
+# ---------------------------------------------------------------------------
+
+
+def _dispatch_emergency_notification(
+    tool_input_data: dict,
+    state: WorkflowState,
+    db: Session,
+    practice_id: str,
+) -> tuple[str, WorkflowState, list[str]]:
+    """
+    1. Create a StaffNotification (+ WorkQueueItem for escalations).
+    2. Search for the earliest urgent / emergency slot in the next 2 days.
+    3. If slots are available: present them so the patient can book immediately.
+    4. If no urgent slots: confirm callback / manual-review and notify staff.
+    """
+    from schemas.tools import CreateStaffNotificationInput, SearchSlotsInput
+    from tools.notification_tools import create_staff_notification
+    from tools.scheduling_tools import search_slots
+    from datetime import date as _date, timedelta
+
+    first_name = tool_input_data.get("first_name", "")
+    emergency_summary = (
+        tool_input_data.get("emergency_summary")
+        or "Patient requested urgent assistance via SMS chatbot."
+    )
+
+    # Build notification body
+    name_part = f"Patient: {first_name} {tool_input_data.get('last_name', '')}".strip()
+    phone_part = f"Phone: {tool_input_data.get('phone_number', 'not provided')}"
+    body = f"{name_part}. {phone_part}. Summary: {emergency_summary}"
+
+    notif_result = create_staff_notification(
+        db,
+        CreateStaffNotificationInput(
+            notification_type="emergency",
+            priority="urgent",
+            title="Urgent patient — emergency SMS",
+            body=body,
+            patient_id=state.patient_id,
+            practice_id=practice_id,
+        ),
+        practice_id=practice_id,
+    )
+
+    tools_called = ["create_staff_notification"]
+    notif_ok = notif_result.success
+
+    # Search for the earliest emergency/urgent slot in the next 48 hours
+    today = _date.today()
+    urgent_result = search_slots(
+        db,
+        SearchSlotsInput(
+            appointment_type_code="emergency",
+            date_from=today,
+            date_to=today + timedelta(days=2),
+            preferred_time_of_day="any",
+        ),
+    )
+
+    if urgent_result.slots:
+        tools_called.append("search_slots")
+        options = urgent_result.slots[:3]
+        slot_options = [{"id": s.id, "label": f"{s.date_label}, {s.time_label}"} for s in options]
+        lines = "\n".join(f"{i + 1}. {s.date_label}, {s.time_label}" for i, s in enumerate(options))
+
+        notif_line = (
+            "I've already sent an alert to our team — they know you need urgent help."
+            if notif_ok else
+            "I'm flagging this for our team right now."
+        )
+        reply = (
+            f"{notif_line}\n\n"
+            "We have these urgent slots available:\n\n"
+            f"{lines}\n\n"
+            "Which one works for you? Reply with 1, 2, or 3. "
+            "If none work, just say so and we'll have someone call you as soon as possible."
+        )
+        new_state = state.model_copy(
+            update={
+                "step": "selecting_slot",
+                "slot_options": slot_options,
+                # Keep emergency flag so book_appointment stores is_emergency=True
+                "collected_fields": {
+                    **state.collected_fields,
+                    "_is_emergency": True,
+                    "appointment_type": "emergency",
+                },
+            }
+        )
+        return reply, new_state, tools_called
+
+    # No urgent slots — escalate to callback / manual review
+    callback_notif = create_staff_notification(
+        db,
+        CreateStaffNotificationInput(
+            notification_type="callback_request",
+            priority="urgent",
+            title="Emergency callback needed — no urgent slots available",
+            body=body,
+            patient_id=state.patient_id,
+            practice_id=practice_id,
+        ),
+        practice_id=practice_id,
+    )
+    if callback_notif.success:
+        tools_called.append("create_staff_notification:callback")
+
+    reply = (
+        "I've notified our team and they'll call you back as soon as possible — "
+        "this has been flagged as urgent. Please don't wait if you're in severe pain; "
+        "go to your nearest emergency dental clinic or call 911 if it's a medical emergency."
+    )
+    new_state = state.model_copy(update={"step": "confirmed"})
+    return reply, new_state, tools_called
+
+
+# ---------------------------------------------------------------------------
+# Family booking dispatch
+# ---------------------------------------------------------------------------
+
+
+def _dispatch_family_booking(
+    tool_input_data: dict,
+    state: WorkflowState,
+    db: Session,
+    practice_id: str,
+) -> tuple[str, WorkflowState, list[str]]:
+    """
+    Attempt grouped family booking using the collected fields.
+    Falls back to a staff callback / manual-review notification if exact
+    grouped slots cannot be found.
+    """
+    from datetime import date as _date, timedelta
+    from schemas.appointment import FamilyBookingIn, FamilyBookingMemberIn
+    from schemas.tools import BookFamilyAppointmentsInput, CreateStaffNotificationInput
+    from tools.scheduling_tools import book_family_appointments
+    from tools.notification_tools import create_staff_notification
+    from tools.validators import normalize_appointment_type
+
+    if not state.patient_id:
+        return (
+            "I need to verify your identity first before I can book for the whole family.",
+            state,
+            [],
+        )
+
+    # Build member list from collected fields.
+    # family_count tells us how many; appointment_type is shared unless per-member types collected.
+    family_count = int(tool_input_data.get("family_count") or 2)
+    raw_type = (
+        tool_input_data.get("appointment_type")
+        or tool_input_data.get("appointment_type_code")
+        or "cleaning"
+    )
+    try:
+        appt_code = normalize_appointment_type(str(raw_type))
+    except ValueError:
+        appt_code = "cleaning"
+
+    preferred_time = tool_input_data.get("preferred_time_of_day") or "any"
+    group_pref = tool_input_data.get("group_preference") or "back_to_back"
+
+    date_from = tool_input_data.get("preferred_date_from") or _date.today() + timedelta(days=1)
+    if isinstance(date_from, str):
+        try:
+            date_from = _date.fromisoformat(date_from)
+        except ValueError:
+            date_from = _date.today() + timedelta(days=1)
+    date_to = date_from + timedelta(days=14)
+
+    # All family members share the same patient_id (primary account holder) for this
+    # prototype — a production version would collect individual patient records.
+    members = [
+        FamilyBookingMemberIn(
+            patient_id=state.patient_id,
+            appointment_type_code=appt_code,
+            preferred_time_of_day=preferred_time,
+        )
+        for _ in range(family_count)
+    ]
+
+    payload = BookFamilyAppointmentsInput(
+        members=members,
+        group_preference=group_pref,
+        date_from=date_from,
+        date_to=date_to,
+        conversation_id=state.conversation_id,
+    )
+
+    result = book_family_appointments(db, payload)
+
+    if result.all_booked:
+        appt_lines = "\n".join(
+            f"{i + 1}. {a.appointment_type_display} — {a.date_label}, {a.time_label}"
+            for i, a in enumerate(result.appointments)
+        )
+        reply = (
+            f"All booked! Here's a summary of the appointments:\n\n"
+            f"{appt_lines}\n\n"
+            "You'll receive a confirmation for each one. See you all soon!"
+        )
+        new_state = state.model_copy(update={"step": "confirmed"})
+        return reply, new_state, ["book_family_appointments"]
+
+    # Partial or no bookings — notify staff for manual coordination
+    booked_count = len(result.appointments)
+    failed_count = len(result.partial_failures)
+
+    notif_body = (
+        f"Family booking request for patient_id={state.patient_id}. "
+        f"Requested {family_count} x {appt_code} ({group_pref}) from {date_from}. "
+        f"Booked {booked_count}, failed {failed_count}. "
+        f"Manual coordination required."
+    )
+    create_staff_notification(
+        db,
+        CreateStaffNotificationInput(
+            notification_type="family_scheduling_complexity",
+            priority="normal",
+            title="Family booking requires manual coordination",
+            body=notif_body,
+            patient_id=state.patient_id,
+            practice_id=practice_id,
+        ),
+        practice_id=practice_id,
+    )
+
+    if booked_count == 0:
+        reply = (
+            "I wasn't able to find back-to-back slots for everyone in that window. "
+            "I've flagged this for our team and someone will call you to coordinate a time that works for the whole family."
+        )
+    else:
+        booked_lines = "\n".join(
+            f"{i + 1}. {a.appointment_type_display} — {a.date_label}, {a.time_label}"
+            for i, a in enumerate(result.appointments)
+        )
+        reply = (
+            f"I managed to book {booked_count} of the {family_count} appointments:\n\n"
+            f"{booked_lines}\n\n"
+            f"I couldn't fit the remaining {failed_count} into that window back-to-back. "
+            "Our team will reach out to sort the rest — sorry for the extra step!"
+        )
+
+    new_state = state.model_copy(update={"step": "confirmed"})
+    return reply, new_state, ["book_family_appointments", "create_staff_notification"]

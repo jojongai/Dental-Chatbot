@@ -30,44 +30,8 @@ class Workflow(StrEnum):
     HANDOFF = "handoff"
 
 
-# Each workflow has a defined set of fields that must be collected.
-# The chatbot uses this map to track progress and know what to ask next.
-WORKFLOW_REQUIRED_FIELDS: dict[str, list[str]] = {
-    Workflow.NEW_PATIENT_REGISTRATION: [
-        "first_name",
-        "last_name",
-        "phone_number",
-        "date_of_birth",
-        "appointment_type",
-    ],
-    Workflow.EXISTING_PATIENT_VERIFICATION: [
-        "last_name",
-        "date_of_birth",
-    ],
-    Workflow.BOOK_APPOINTMENT: [
-        "patient_id",
-        "appointment_type",
-        "preferred_date_from",
-    ],
-    Workflow.RESCHEDULE_APPOINTMENT: [
-        "appointment_id",
-        "preferred_date_from",
-    ],
-    Workflow.CANCEL_APPOINTMENT: [
-        "appointment_id",
-        "cancel_reason",
-    ],
-    Workflow.FAMILY_BOOKING: [
-        "family_member_list",  # [{patient_id, appointment_type}]
-        "group_preference",
-    ],
-    Workflow.EMERGENCY_TRIAGE: [
-        "emergency_summary",
-        "patient_contact",  # phone or patient_id
-    ],
-    Workflow.GENERAL_INQUIRY: [],  # no required fields; open-ended
-}
-
+# Required fields per workflow are defined in state_machine/definitions.py (WORKFLOWS map).
+# That is the single source of truth — do not duplicate them here.
 
 # ---------------------------------------------------------------------------
 # Action types the backend can instruct the frontend to render
@@ -94,6 +58,34 @@ class ChatAction(BaseModel):
 # Workflow state (round-tripped between client and server)
 # ---------------------------------------------------------------------------
 
+
+
+# Fields safe to carry from a verified patient record or prior identity step into a
+# **new** SMS thread. Never carry workflow intent, scheduling, or emergency text here.
+IDENTITY_FIELD_KEYS: frozenset[str] = frozenset({
+    "first_name",
+    "last_name",
+    "phone_number",
+    "date_of_birth",
+    "email",
+    "insurance_name",
+})
+
+
+def workflow_state_for_new_conversation(state: WorkflowState | None) -> WorkflowState:
+    """
+    Start a fresh conversation: drop prior-thread intent (why they messaged, dates,
+    appointment types, emergencies, pending sub-workflows) while optionally keeping
+    verified identity and patient_id for demographic pre-fill only.
+    """
+    if state is None:
+        return WorkflowState()
+    old_cf = state.collected_fields or {}
+    identity = {k: v for k, v in old_cf.items() if k in IDENTITY_FIELD_KEYS}
+    return WorkflowState(
+        patient_id=state.patient_id,
+        collected_fields=identity,
+    )
 
 
 class WorkflowState(BaseModel):
@@ -160,6 +152,14 @@ class ChatRequest(BaseModel):
     is_session_opening: bool = Field(
         False,
         description="First SMS after missed call — opening message + caller identification only.",
+    )
+    new_conversation: bool = Field(
+        False,
+        description=(
+            "When True, treat this as a new thread: strip workflow-specific state "
+            "(intent, slots, pending workflows) and keep only identity fields + patient_id. "
+            "Use when the same patient starts a new SMS session so prior chat goals are not reused."
+        ),
     )
 
     @model_validator(mode="after")

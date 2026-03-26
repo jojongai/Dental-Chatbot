@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from models.scheduling import Appointment, AppointmentRequest, AppointmentSlot, AppointmentType
 from models.staff import Provider
-from schemas.appointment import AppointmentOut, SlotOut, SlotSearchOut
+from schemas.appointment import AppointmentOut, FamilyBookingMemberIn, SlotOut, SlotSearchOut
 from schemas.tools import (
     AppointmentSummary,
     BookAppointmentInput,
@@ -392,5 +392,146 @@ def cancel_appointment(db: Session, payload: CancelAppointmentInput) -> CancelAp
 
 
 def book_family_appointments(db: Session, payload: BookFamilyAppointmentsInput) -> BookFamilyAppointmentsOutput:
-    """Book back-to-back or same-day appointments for multiple family members."""
-    raise NotImplementedError("book_family_appointments not yet implemented")
+    """
+    Book back-to-back (or same-day) appointments for multiple family members.
+
+    Strategy:
+    1. For each member, run a slot search using the shared date window and time preference.
+    2. For 'back_to_back': sort available slots and pick consecutive time blocks
+       (one slot per member, each starting when the previous one ends).
+    3. For 'same_day': pick any available slots on the same calendar day.
+    4. Book all selected slots atomically; roll back any partial books on failure.
+    5. Return booked appointments + partial_failures list.
+    """
+    from datetime import datetime as _dt
+
+    date_from_dt = _dt(
+        payload.date_from.year, payload.date_from.month, payload.date_from.day, 0, 0, tzinfo=TZ
+    )
+    date_to_dt = _dt(
+        payload.date_to.year, payload.date_to.month, payload.date_to.day, 23, 59, tzinfo=TZ
+    )
+
+    # ── Gather candidate slots for all members ────────────────────────────────
+    # We do a single pass over available slots and then assign them greedily.
+
+    all_candidate_slots: list[AppointmentSlot] = []
+    appt_type_cache: dict[str, AppointmentType | None] = {}
+
+    for member in payload.members:
+        try:
+            appt_code = normalize_appointment_type(member.appointment_type_code)
+        except ValueError:
+            appt_code = member.appointment_type_code
+
+        if appt_code not in appt_type_cache:
+            appt_type_cache[appt_code] = db.execute(
+                select(AppointmentType).where(AppointmentType.code == appt_code)
+            ).scalar_one_or_none()
+
+        appt_type = appt_type_cache[appt_code]
+        if not appt_type:
+            continue
+
+        tod = member.preferred_time_of_day or "any"
+        hour_min, hour_max = _TIME_RANGES.get(tod, (0, 24))
+
+        stmt = (
+            select(AppointmentSlot)
+            .where(AppointmentSlot.slot_status == "available")
+            .where(AppointmentSlot.appointment_type_id == appt_type.id)
+            .where(AppointmentSlot.starts_at >= date_from_dt)
+            .where(AppointmentSlot.starts_at <= date_to_dt)
+            .order_by(AppointmentSlot.starts_at)
+        )
+        slots = list(db.execute(stmt).scalars().all())
+        if tod != "any":
+            slots = [s for s in slots if hour_min <= s.starts_at.astimezone(TZ).hour < hour_max]
+        all_candidate_slots.extend(slots)
+
+    # Deduplicate and sort by start time
+    seen: set[str] = set()
+    unique_slots: list[AppointmentSlot] = []
+    for s in sorted(all_candidate_slots, key=lambda x: x.starts_at):
+        if s.id not in seen:
+            seen.add(s.id)
+            unique_slots.append(s)
+
+    # ── Assign slots per member ───────────────────────────────────────────────
+    assigned: list[tuple[AppointmentSlot, AppointmentType, "FamilyBookingMemberIn"]] = []
+    used_slot_ids: set[str] = set()
+    last_end: _dt | None = None
+
+    for member in payload.members:
+        try:
+            appt_code = normalize_appointment_type(member.appointment_type_code)
+        except ValueError:
+            appt_code = member.appointment_type_code
+
+        appt_type = appt_type_cache.get(appt_code)
+        if not appt_type:
+            continue  # will be counted as partial_failure below
+
+        for slot in unique_slots:
+            if slot.id in used_slot_ids:
+                continue
+            if slot.appointment_type_id != appt_type.id:
+                continue
+
+            if payload.group_preference == "back_to_back" and last_end is not None:
+                # Accept only if this slot starts right when the previous ends
+                # (within a 1-minute tolerance for rounding)
+                gap = (slot.starts_at - last_end).total_seconds()
+                if not (0 <= gap <= 60):
+                    continue
+
+            # Candidate found
+            assigned.append((slot, appt_type, member))
+            used_slot_ids.add(slot.id)
+            last_end = slot.ends_at
+            break
+
+    # ── Book all assigned slots ───────────────────────────────────────────────
+    booked_appointments: list[AppointmentOut] = []
+    partial_failures: list[str] = []
+
+    for slot, appt_type, member in assigned:
+        # Re-check availability inside the transaction
+        fresh = db.get(AppointmentSlot, slot.id)
+        if not fresh or fresh.slot_status != "available":
+            partial_failures.append(member.patient_id)
+            continue
+
+        fresh.slot_status = "booked"
+        appointment = Appointment(
+            patient_id=member.patient_id,
+            slot_id=fresh.id,
+            location_id=fresh.location_id,
+            provider_id=fresh.provider_id,
+            operatory_id=fresh.operatory_id,
+            appointment_type_id=appt_type.id,
+            status="booked",
+            booked_via="chatbot",
+            scheduled_starts_at=fresh.starts_at,
+            scheduled_ends_at=fresh.ends_at,
+            reason_for_visit=member.special_instructions,
+            is_emergency=False,
+        )
+        db.add(appointment)
+        db.flush()
+        booked_appointments.append(_appt_to_out(appointment, db))
+
+    # Members that had no slot assigned at all
+    assigned_patient_ids = {m.patient_id for _, _, m in assigned}
+    for member in payload.members:
+        if member.patient_id not in assigned_patient_ids:
+            partial_failures.append(member.patient_id)
+
+    db.commit()
+
+    return BookFamilyAppointmentsOutput(
+        appointments=booked_appointments,
+        group_preference=payload.group_preference,
+        all_booked=len(partial_failures) == 0,
+        partial_failures=list(set(partial_failures)),
+    )

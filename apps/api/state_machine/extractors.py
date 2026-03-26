@@ -6,7 +6,22 @@ Each extractor receives a raw user message string and returns either:
   - A scalar      → single extracted value
   - A dict        → multiple fields extracted in one pass (e.g. full_name → first+last)
 
-All extraction is intentionally lenient to handle natural conversational text.
+Taxonomy
+--------
+Deterministic extractors (referenced from definitions.FIELDS, always run):
+  extract_full_name, extract_last_name, extract_phone, extract_email,
+  extract_dob, extract_confirmation
+
+Semantic fallback extractors (used ONLY by the interpreter's keyword/regex
+fallback path when USE_LLM=false or the API is unavailable):
+  extract_insurance, extract_appointment_type, extract_preferred_date,
+  extract_time_of_day, extract_emergency_summary, extract_cancel_reason,
+  extract_group_preference, extract_family_count
+
+Semantic extractors are NOT referenced from definitions.FIELDS — the LLM
+interpreter handles these fields in production. They exist here so that
+the USE_LLM=false code path (tests, local dev without an API key) can
+produce the same InterpreterOutput shape without hitting the API.
 """
 
 from __future__ import annotations
@@ -21,7 +36,9 @@ from typing import Any
 
 _NAME_LEAD_PATTERNS = [
     r"(?:my name is|i'm|i am|this is|it's|it is|name's|name is)\s+([A-Za-z][a-zA-Z\-']+(?:\s+[A-Za-z][a-zA-Z\-']+)+)",
-    r"(?:patient|calling|i go by)\s+([A-Za-z][a-zA-Z\-']+(?:\s+[A-Za-z][a-zA-Z\-']+)+)",
+    # "i go by" is a deliberate name introduction; "patient" / "calling" removed —
+    # they matched intent phrases like "new patient looking to book"
+    r"(?:i go by)\s+([A-Za-z][a-zA-Z\-']+(?:\s+[A-Za-z][a-zA-Z\-']+)+)",
 ]
 
 
@@ -178,17 +195,28 @@ def _safe_date(year: int, month: int, day: int) -> date | None:
         return None
 
 
+# ===========================================================================
+# SEMANTIC FALLBACK EXTRACTORS
+#
+# These are used ONLY by llm/interpreter.py's _keyword_interpret() path
+# (when USE_LLM=false or the Gemini API is unavailable).
+# They are NOT referenced from state_machine/definitions.py.
+# In production, the LLM interpreter handles these fields directly.
+# ===========================================================================
+
 # ---------------------------------------------------------------------------
 # Insurance
 # ---------------------------------------------------------------------------
 
 _NO_INSURANCE_RE = re.compile(
-    r"\b(no insurance|self[\s\-]?pay|uninsured|don'?t have|do not have|none|no coverage|cash)\b",
+    r"\b(no insurance|self[\s\-]?pay|uninsured|don'?t have|do not have|none|no coverage|cash"
+    r"|i don'?t|nope|nah|no$|not covered|no plan|without insurance|pay out of pocket)\b",
     re.IGNORECASE,
 )
 
 _KNOWN_CARRIERS: list[str] = [
     "sun life",
+    "sunlife",
     "manulife",
     "green shield",
     "canada life",
@@ -450,13 +478,49 @@ def extract_slot_choice(text: str) -> int | None:
 
 
 def extract_confirmation(text: str) -> bool | None:
-    """Returns True for affirmative, False for negative, None if unclear."""
+    """
+    Returns True for affirmative, False for negative, None if unclear.
+
+    Handles both explicit yes/no and natural conversational phrases like:
+      "yeah that should be fine", "works for me", "let's do it",
+      "actually not that one", "maybe try a different time"
+    """
     lower = text.strip().lower()
-    _yes_re = r"^(yes|yeah|yep|yup|sure|correct|that'?s right|confirm|ok|okay|go ahead|please do|sounds good)[\s.!]*$"
-    if re.match(_yes_re, lower):
-        return True
-    if re.match(r"^(no|nope|nah|cancel|stop|not right|wrong|wait|hold on|actually)[\s.!?]*$", lower):
-        return False
+
+    _yes_patterns = [
+        # Single-word / short affirmatives
+        r"^(yes|yeah|yep|yup|yah|sure|correct|that'?s right|that'?s correct|confirm|confirmed"
+        r"|ok|okay|k|go ahead|please do|sounds good|looks good|looks right|all good"
+        r"|go for it|perfect|great|do it|book it|proceed|definitely|absolutely"
+        r"|works for me|that works|that'?s fine|that'?s great|that'?s perfect"
+        r"|let'?s do it|let'?s go|sounds right|that'?s correct)[\s.!,]*$",
+        # Phrases that contain affirmative signals
+        r"\b(yes|correct|confirmed|looks (good|right|correct)|all (looks )?good"
+        r"|go ahead|sounds good|works for me|that works|fine with me"
+        r"|that'?s fine|that'?s right|that'?s great|should be fine"
+        r"|i (confirm|agree|approve)|please (proceed|book|confirm))\b",
+    ]
+    for pat in _yes_patterns:
+        if re.search(pat, lower):
+            return True
+
+    _no_patterns = [
+        # Single-word / short negatives
+        r"^(no|nope|nah|cancel|stop|not right|wrong|wait|hold on|actually|change|incorrect"
+        r"|not that|not quite|nah|neither)[\s.!?]*$",
+        # Phrases indicating something is wrong
+        r"\b(no,? (that'?s|it'?s) (wrong|incorrect|not right)"
+        r"|please (change|fix|update|edit|redo)"
+        r"|change something|change that|that'?s? (wrong|not right|incorrect)"
+        r"|let me fix|is wrong|is incorrect"
+        r"|actually not|not that one|not that time|different (time|date|day)"
+        r"|maybe (try|a different)|try again|try a different"
+        r"|wait,? (change|fix|update|no)|hold on,? (change|actually))\b",
+    ]
+    for pat in _no_patterns:
+        if re.search(pat, lower):
+            return False
+
     return None
 
 

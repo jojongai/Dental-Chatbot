@@ -4,34 +4,73 @@ WorkflowStateMachine — the core of the chatbot control flow.
 Responsibilities
 ----------------
 1. Accept a WorkflowState + a raw user message.
-2. Run every relevant field extractor against the message.
-3. Update collected_fields and recompute missing_fields.
-4. Determine the next action:
+2. Call the LLM interpreter once to understand the message (extract fields,
+   detect topic switches, detect escalation signals).
+3. Run deterministic regex extractors for high-confidence fields (phone, email,
+   DOB, confirmation) as an authoritative override pass.
+4. Update collected_fields and recompute missing_fields.
+5. Determine the next action:
      a. Sub-workflow needed (patient not yet verified)
         → switch to EXISTING_PATIENT_VERIFICATION, remember pending workflow
-     b. Still collecting fields
+     b. Topic switch detected
+        → reset to the new workflow
+     c. Escalation requested
+        → hand off to HANDOFF workflow
+     d. Still collecting fields
         → return the next missing field's prompt
-     c. Requires confirmation
+     e. Requires confirmation
         → build a summary and ask "does this look right?"
-     d. Ready to call tool
+     f. Ready to call tool
         → set ready_to_call=True, tool_name, tool_input_data
-5. Return a MachineResult (fully typed; no LLM involved).
+6. Return a MachineResult (fully typed; no direct LLM tool calls here).
 
 The router then:
   - Sends result.reply to the user
   - If result.ready_to_call: calls the tool and appends the result
   - Persists the updated WorkflowState
+
+Architecture note
+-----------------
+Language understanding lives entirely in llm/interpreter.py (InterpreterOutput).
+This file owns only deterministic workflow logic.
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any
 
+from llm.interpreter import WorkflowTransition
 from schemas.chat import ActionType, ChatAction, Workflow, WorkflowState
 from state_machine.definitions import FIELDS, WORKFLOWS, FieldDef, WorkflowDef
-from state_machine.extractors import extract_confirmation
+
+logger = logging.getLogger(__name__)
+
+# Fields where regex is the authoritative source — always run after interpreter.
+# These are too structurally strict for the LLM to handle reliably.
+_DETERMINISTIC_FIELDS = frozenset({"phone_number", "date_of_birth", "email"})
+
+# ---------------------------------------------------------------------------
+# Emergency safety guardrail — deterministic, runs before the LLM
+# ---------------------------------------------------------------------------
+# These phrases indicate a potential dental emergency regardless of what the
+# LLM concludes.  The guardrail fires independently as a backstop so that
+# no patient describing a serious situation is ever missed because the LLM
+# classified it differently.
+_EMERGENCY_PHRASES = frozenset({
+    "severe pain", "a lot of pain", "so much pain", "unbearable pain",
+    "swollen", "swelling", "my face is",
+    "bleeding", "blood",
+    "knocked out", "knocked-out", "tooth fell out", "tooth came out",
+    "broken tooth", "broke my tooth", "cracked tooth",
+    "abscess", "infection", "pus",
+    "trouble breathing", "can't breathe", "hard to breathe",
+    "trauma", "hit my mouth", "hit in the mouth", "accident",
+    "emergency", "urgent", "asap", "as soon as possible",
+    "i'm in pain", "im in pain", "in a lot of pain",
+})
 
 # ---------------------------------------------------------------------------
 # Result type
@@ -67,8 +106,9 @@ class MachineResult:
 
 
 # ---------------------------------------------------------------------------
-# Workflow intent detection
+# Workflow intent detection (opening turn / mid-flow guard)
 # ---------------------------------------------------------------------------
+
 
 def detect_intent(message: str, current: WorkflowState) -> Workflow:
     """
@@ -89,6 +129,7 @@ def detect_intent(message: str, current: WorkflowState) -> Workflow:
         return current.workflow  # stay in current workflow
 
     from llm.intent import classify_intent
+
     return classify_intent(message)
 
 
@@ -110,14 +151,30 @@ class WorkflowStateMachine:
         Process one user message turn.
         Returns a MachineResult describing what to reply and whether a tool is ready.
         """
-        # 1. Detect / confirm workflow
+        # 1. Emergency safety guardrail — deterministic, runs before everything else.
+        #    Fires on obvious safety phrases regardless of LLM classification.
+        if (
+            self.state.workflow != Workflow.EMERGENCY_TRIAGE
+            and _is_emergency(message)
+        ):
+            logger.warning("Emergency guardrail fired for message: %r", message[:80])
+            self.state = self.state.model_copy(
+                update={
+                    "workflow": Workflow.EMERGENCY_TRIAGE,
+                    "step": "start",
+                    "collected_fields": _carry_forward_fields(self.state.collected_fields),
+                    "missing_fields": [],
+                }
+            )
+            return self.process(message)
+
+        # 2. Detect / confirm workflow (opening turn or mid-flow guard)
         workflow = detect_intent(message, self.state)
         wf_def = WORKFLOWS[workflow]
 
         # Handle sub-workflow: if this workflow needs patient_id and we don't have one,
         # pivot to EXISTING_PATIENT_VERIFICATION and remember where to return.
         if wf_def.requires_patient_id and not self.state.patient_id:
-            # Store the intended workflow so we resume after verification
             new_state = self.state.model_copy(
                 update={
                     "workflow": Workflow.EXISTING_PATIENT_VERIFICATION,
@@ -133,7 +190,7 @@ class WorkflowStateMachine:
             workflow = Workflow.EXISTING_PATIENT_VERIFICATION
             self.state = new_state
 
-        # 2. First turn: greet and set workflow
+        # 3. First turn: set workflow and step
         is_first_turn = self.state.workflow == Workflow.GENERAL_INQUIRY and workflow != Workflow.GENERAL_INQUIRY
         if is_first_turn or self.state.step == "start":
             self.state = self.state.model_copy(
@@ -143,74 +200,184 @@ class WorkflowStateMachine:
                 }
             )
 
-        # 3. Extract fields from this message
-        self.state = self._extract_fields(message, wf_def)
+        # 4. Interpret the message (LLM or keyword fallback) + extract fields
+        self.state, interp = self._extract_fields(message, wf_def)
 
-        # 4. Compute what's still missing
+        # 5. Log interpreter output for observability
+        _log_interpreter_turn(message, self.state, interp)
+
+        # 6. Handle workflow transition signals from interpreter.
+        #
+        #    SWITCH  — user clearly wants a different workflow; reset only when
+        #              confidence is high AND the new intent is materially different.
+        #    BRANCH  — side question while staying in current workflow; log only.
+        #    CONTINUE — no action needed.
+        if interp.workflow_transition == WorkflowTransition.SWITCH:
+            if (
+                interp.primary_intent
+                and interp.primary_intent != self.state.workflow
+                and interp.confidence >= 0.75
+            ):
+                new_workflow = _safe_workflow(interp.primary_intent)
+                if new_workflow and new_workflow != Workflow.GENERAL_INQUIRY:
+                    logger.info(
+                        "Workflow SWITCH: %s → %s (confidence=%.2f, reason=%r)",
+                        self.state.workflow,
+                        new_workflow,
+                        interp.confidence,
+                        interp.reasoning_summary,
+                    )
+                    self.state = self.state.model_copy(
+                        update={
+                            "workflow": new_workflow,
+                            "step": "start",
+                            "collected_fields": _carry_forward_fields(self.state.collected_fields),
+                            "missing_fields": [],
+                        }
+                    )
+                    return self.process(message)
+
+        elif interp.workflow_transition == WorkflowTransition.BRANCH:
+            logger.info(
+                "Workflow BRANCH detected in %s (reason=%r) — continuing current workflow",
+                self.state.workflow,
+                interp.reasoning_summary,
+            )
+            # Do NOT reset; the current workflow continues after this turn.
+
+        # 7. Handle escalation request (LLM signal — guardrail already handled
+        #    obvious phrases above).
+        if interp.should_escalate and self.state.workflow not in (
+            Workflow.HANDOFF, Workflow.EMERGENCY_TRIAGE
+        ):
+            logger.info("Escalation requested by interpreter (reason=%r)", interp.reasoning_summary)
+            self.state = self.state.model_copy(
+                update={
+                    "workflow": Workflow.HANDOFF,
+                    "step": "start",
+                    "collected_fields": _carry_forward_fields(self.state.collected_fields),
+                    "missing_fields": [],
+                }
+            )
+            return self.process(message)
+
+        # 8. Compute what's still missing
         missing = self._compute_missing(wf_def)
         self.state = self.state.model_copy(update={"missing_fields": missing})
 
-        # 5. Dispatch to the right next action
+        # 9. Dispatch to the right next action
         if workflow == Workflow.GENERAL_INQUIRY:
             return self._reply_general_inquiry(wf_def)
 
         if missing:
             return self._ask_next_field(missing[0], wf_def, is_first_turn)
 
-        # All required fields present — confirmation or tool call
-        if wf_def.requires_confirmation and self.state.step != "confirmed":
-            return self._ask_confirmation(wf_def)
-
-        # Handle confirmation response
+        # If we already showed the summary and are waiting for a yes/no, handle that first.
         if self.state.step == "awaiting_confirmation":
+            from state_machine.extractors import extract_confirmation
+
+            # Regex is authoritative for confirmation (narrow parser).
+            # Fall back to interpreter's extracted value for natural language
+            # ("yeah that should be fine", "works for me", "let's do it").
             confirmed = extract_confirmation(message)
+            if confirmed is None:
+                confirmed = interp.extracted_fields.get("confirmation")
+
+            if confirmed is True:
+                return self._signal_ready(wf_def)
             if confirmed is False:
                 return self._handle_confirmation_rejected(wf_def)
-            if confirmed is None:
-                return MachineResult(
-                    state=self.state,
-                    reply="I didn't catch that — should I go ahead? (yes / no)",
-                    actions=[ChatAction(type=ActionType.REQUEST_INFO, payload={"fields": ["confirmation"]})],
-                    next_field="confirmation",
-                )
+            return MachineResult(
+                state=self.state,
+                reply="I didn't catch that — should I go ahead?",
+                actions=[ChatAction(type=ActionType.REQUEST_INFO, payload={"fields": ["confirmation"]})],
+                next_field="confirmation",
+            )
+
+        # All required fields present — show confirmation summary if needed
+        if wf_def.requires_confirmation:
+            return self._ask_confirmation(wf_def)
 
         return self._signal_ready(wf_def)
 
     # ------------------------------------------------------------------
-    # Field extraction
+    # Field extraction — interpreter-first, deterministic override
     # ------------------------------------------------------------------
 
-    def _extract_fields(self, message: str, wf_def: WorkflowDef) -> WorkflowState:
+    def _extract_fields(
+        self, message: str, wf_def: WorkflowDef
+    ) -> tuple[WorkflowState, Any]:
         """
-        Run extractors for every field that is either required or optional in this
-        workflow and not yet collected. Returns an updated WorkflowState.
+        Extract fields from the user message using the LLM interpreter (or its
+        keyword fallback), then apply deterministic regex extractors for
+        phone_number, date_of_birth, and email as an authoritative override.
+
+        Returns (updated_state, InterpreterOutput).
         """
+        from llm.interpreter import InterpreterInput, InterpreterOutput, build_field_hints, interpret
+
+        pending_field: str | None = None
+        pending_question: str | None = None
+        if self.state.step.startswith("collecting:"):
+            pending_field = self.state.step.split(":", 1)[1]
+            fd = FIELDS.get(pending_field)
+            pending_question = fd.prompt if fd else None
+
+        clean_collected = {
+            k: v for k, v in self.state.collected_fields.items() if not k.startswith("_")
+        }
+
+        inp = InterpreterInput(
+            message=message,
+            workflow=self.state.workflow,
+            step=self.state.step,
+            pending_field=pending_field,
+            pending_question=pending_question,
+            collected_fields=clean_collected,
+            missing_field_hints=build_field_hints(wf_def, self.state.collected_fields),
+        )
+        interp: InterpreterOutput = interpret(inp)
+
         collected = dict(self.state.collected_fields)
-        all_fields = list(wf_def.required_fields) + list(wf_def.optional_fields)
 
-        for field_key in all_fields:
+        # Merge fields from interpreter (semantic fields)
+        for k, v in interp.extracted_fields.items():
+            if k not in collected and v is not None:
+                # first_name interpreter result may be a plain string — handle multi_key
+                fd = FIELDS.get(k)
+                if fd and fd.multi_key and isinstance(v, dict):
+                    collected.update(v)
+                else:
+                    collected[k] = v
+                logger.debug("Interpreter extracted %r = %r", k, v)
+
+        # Deterministic override: regex is authoritative for phone, DOB, email
+        for field_key in _DETERMINISTIC_FIELDS:
             if field_key in collected:
-                continue  # already have this
-
-            field_def: FieldDef | None = FIELDS.get(field_key)
-            if not field_def:
                 continue
+            fd = FIELDS.get(field_key)
+            if fd and fd.extractor:
+                try:
+                    val = fd.extractor(message)  # type: ignore[call-arg]
+                    if val is not None:
+                        collected[field_key] = val
+                except Exception:
+                    pass
 
-            extractor = field_def.extractor  # type: ignore[attr-defined]
-            try:
-                value = extractor(message)
-            except Exception:
-                continue
+        # Always attempt name extraction via deterministic regex (useful when
+        # the user provides name + phone in the same message)
+        if "first_name" not in collected or "last_name" not in collected:
+            fd = FIELDS.get("first_name")
+            if fd and fd.extractor:
+                try:
+                    val = fd.extractor(message)  # type: ignore[call-arg]
+                    if val is not None and isinstance(val, dict):
+                        if "first_name" not in collected:
+                            collected.update(val)
+                except Exception:
+                    pass
 
-            if value is None:
-                continue
-
-            if field_def.multi_key and isinstance(value, dict):
-                collected.update(value)
-            else:
-                collected[field_key] = value
-
-        return self.state.model_copy(update={"collected_fields": collected})
+        return self.state.model_copy(update={"collected_fields": collected}), interp
 
     # ------------------------------------------------------------------
     # Missing field computation
@@ -219,8 +386,6 @@ class WorkflowStateMachine:
     def _compute_missing(self, wf_def: WorkflowDef) -> list[str]:
         """
         Return required fields that are not yet in collected_fields.
-        Fields that are multi_key may map to multiple collected keys —
-        e.g. 'first_name' definition covers both first_name and last_name.
         """
         collected = self.state.collected_fields
         missing: list[str] = []
@@ -228,8 +393,6 @@ class WorkflowStateMachine:
         for field_key in wf_def.required_fields:
             field_def = FIELDS.get(field_key)
             if field_def and field_def.multi_key:
-                # multi_key: satisfied when *all* produced sub-keys are present
-                # For full_name this means first_name + last_name
                 if field_key == "first_name":
                     if "first_name" not in collected or "last_name" not in collected:
                         missing.append(field_key)
@@ -263,7 +426,10 @@ class WorkflowStateMachine:
             actions=[
                 ChatAction(
                     type=ActionType.REQUEST_INFO,
-                    payload={"field": next_field, "display_name": field_def.display_name if field_def else next_field},
+                    payload={
+                        "field": next_field,
+                        "display_name": field_def.display_name if field_def else next_field,
+                    },
                 )
             ],
             debug=self._debug_snapshot(wf_def),
@@ -271,10 +437,7 @@ class WorkflowStateMachine:
 
     def _ask_confirmation(self, wf_def: WorkflowDef) -> MachineResult:
         summary = self._build_summary()
-        reply = (
-            f"{wf_def.ready_message}\n\n{summary}\n\n"
-            "Does everything look correct? (yes to confirm / no to change something)"
-        )
+        reply = f"{wf_def.ready_message}\n\n{summary}\n\nDoes everything look correct?"
         return MachineResult(
             state=self.state.model_copy(update={"step": "awaiting_confirmation"}),
             reply=reply,
@@ -285,7 +448,6 @@ class WorkflowStateMachine:
         )
 
     def _handle_confirmation_rejected(self, wf_def: WorkflowDef) -> MachineResult:
-        """User said 'no' to confirmation — ask what they'd like to change."""
         return MachineResult(
             state=self.state.model_copy(update={"step": "collecting"}),
             reply="No problem! What would you like to change?",
@@ -295,10 +457,8 @@ class WorkflowStateMachine:
         )
 
     def _signal_ready(self, wf_def: WorkflowDef) -> MachineResult:
-        """All required fields collected and confirmed — ready to call the tool."""
         ready_reply = wf_def.ready_message or "I have everything I need — one moment…"
 
-        # Emergency: add an explicit "staff notified" message
         if wf_def.workflow == Workflow.EMERGENCY_TRIAGE:
             ready_reply = (
                 "I've received your details and our dental team has been notified about "
@@ -314,18 +474,22 @@ class WorkflowStateMachine:
         else:
             actions = []
 
+        # Strip internal sentinel keys before passing to tool
+        tool_data = {
+            k: v for k, v in self.state.collected_fields.items() if not k.startswith("_")
+        }
+
         return MachineResult(
             state=self.state.model_copy(update={"step": "ready"}),
             reply=ready_reply,
             ready_to_call=True,
             tool_name=wf_def.tool_name,
-            tool_input_data=dict(self.state.collected_fields),
+            tool_input_data=tool_data,
             actions=actions,
             debug=self._debug_snapshot(wf_def),
         )
 
     def _reply_general_inquiry(self, wf_def: WorkflowDef) -> MachineResult:
-        """General inquiry: immediately signal tool call so router can fetch clinic info."""
         return MachineResult(
             state=self.state.model_copy(update={"step": "ready"}),
             reply=wf_def.greeting,
@@ -336,12 +500,19 @@ class WorkflowStateMachine:
             debug=self._debug_snapshot(wf_def),
         )
 
+    def _signal_handoff(self) -> MachineResult:
+        """Fast path when interpreter flags an escalation request."""
+        wf_def = WORKFLOWS[Workflow.HANDOFF]
+        self.state = self.state.model_copy(
+            update={"workflow": Workflow.HANDOFF, "step": "start"}
+        )
+        return self._ask_next_field("phone_number", wf_def, is_first_turn=True)
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
     def _build_summary(self) -> str:
-        """Build a human-readable summary of collected fields."""
         cf = self.state.collected_fields
         lines: list[str] = []
 
@@ -367,7 +538,6 @@ class WorkflowStateMachine:
         return "\n".join(lines) if lines else "(no details collected yet)"
 
     def _debug_snapshot(self, wf_def: WorkflowDef) -> dict:
-        """Return a debug-friendly view of current machine state."""
         return {
             "workflow": self.state.workflow,
             "step": self.state.step,
@@ -379,6 +549,70 @@ class WorkflowStateMachine:
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _safe_workflow(label: str) -> Workflow | None:
+    try:
+        return Workflow(label)
+    except ValueError:
+        return None
+
+
+def _carry_forward_fields(collected: dict[str, Any]) -> dict[str, Any]:
+    """Keep name and phone when switching workflows — avoids re-asking."""
+    keep = {"first_name", "last_name", "phone_number"}
+    return {k: v for k, v in collected.items() if k in keep}
+
+
+def _is_emergency(message: str) -> bool:
+    """
+    Deterministic guardrail that fires on obvious safety-related phrases.
+    Intentionally conservative — only phrases that unambiguously signal a
+    dental emergency or safety concern.  Runs before the LLM so that no
+    urgent patient is ever misrouted by an incorrect LLM classification.
+    """
+    lower = message.lower()
+    return any(phrase in lower for phrase in _EMERGENCY_PHRASES)
+
+
+def _log_interpreter_turn(
+    message: str,
+    state: WorkflowState,
+    interp: Any,
+) -> None:
+    """
+    Emit a structured DEBUG log line per turn so failures are easy to diagnose.
+    Enabled at DEBUG level; zero cost in production at INFO/WARNING.
+    """
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+
+    pending_field: str | None = None
+    if state.step.startswith("collecting:"):
+        pending_field = state.step.split(":", 1)[1]
+
+    logger.debug(
+        "interpreter_turn | workflow=%s step=%s pending=%s "
+        "transition=%s escalate=%s confidence=%.2f "
+        "extracted=%r answered=%r uncertain=%r "
+        "message=%r reasoning=%r",
+        state.workflow,
+        state.step,
+        pending_field,
+        interp.workflow_transition,
+        interp.should_escalate,
+        interp.confidence,
+        interp.extracted_fields,
+        interp.answered_fields,
+        interp.uncertain_fields,
+        message[:120],
+        interp.reasoning_summary,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Convenience: snapshot for the /chat endpoint debug header
 # ---------------------------------------------------------------------------
 
@@ -386,20 +620,28 @@ class WorkflowStateMachine:
 def machine_status(state: WorkflowState) -> dict:
     """
     Return a concise status dict for logging / debugging without processing a message.
-    Useful for staff dashboard: what does the machine know and what does it still need?
     """
     if state.workflow not in WORKFLOWS:
         return {"workflow": state.workflow, "status": "unknown"}
 
     wf_def = WORKFLOWS[state.workflow]
     required = wf_def.required_fields
-    missing = [f for f in required if f not in state.collected_fields]
+    collected = state.collected_fields
+
+    missing: list[str] = []
+    for f in required:
+        fd = FIELDS.get(f)
+        if fd and fd.multi_key and f == "first_name":
+            if "first_name" not in collected or "last_name" not in collected:
+                missing.append(f)
+        elif f not in collected:
+            missing.append(f)
 
     return {
         "workflow": state.workflow,
         "display_name": wf_def.display_name,
         "step": state.step,
-        "collected_fields": {k: v for k, v in state.collected_fields.items() if not k.startswith("_")},
+        "collected_fields": {k: v for k, v in collected.items() if not k.startswith("_")},
         "missing_fields": missing,
         "required_fields": required,
         "optional_fields": wf_def.optional_fields,

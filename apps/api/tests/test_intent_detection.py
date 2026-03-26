@@ -38,16 +38,30 @@ def detect(message: str) -> Workflow:
 
 class TestKeywordIntentMap:
     def test_new_patient_explicit(self):
-        assert intent("I'm a new patient") == Workflow.NEW_PATIENT_REGISTRATION
+        # "new patient" alone is a patient-type signal, not a workflow intent.
+        # The LLM (or receptionist fallback) will ask "How can I help you?" in response.
+        assert intent("I'm a new patient") == Workflow.GENERAL_INQUIRY
 
     def test_new_patient_first_time(self):
+        # "First time visiting" has a clear action component → new patient registration.
         assert intent("First time visiting") == Workflow.NEW_PATIENT_REGISTRATION
 
+    def test_new_patient_wants_to_register(self):
+        # Explicit registration intent → routes directly.
+        assert intent("I want to register as a new patient") == Workflow.NEW_PATIENT_REGISTRATION
+
     def test_existing_patient_explicit(self):
-        assert intent("I'm an existing patient") == Workflow.BOOK_APPOINTMENT
+        # "existing patient" alone is a patient-type signal with no stated intent.
+        # Receptionist will ask "How can I help you?" in response.
+        assert intent("I'm an existing patient") == Workflow.GENERAL_INQUIRY
 
     def test_existing_patient_been_before(self):
-        assert intent("I've been a patient there before") == Workflow.BOOK_APPOINTMENT
+        # Same — just identifies as existing, no action stated.
+        assert intent("I've been a patient there before") == Workflow.GENERAL_INQUIRY
+
+    def test_existing_patient_wants_to_book(self):
+        # When they also state a booking intent, it routes correctly.
+        assert intent("I'm an existing patient and want to book an appointment") == Workflow.BOOK_APPOINTMENT
 
     def test_book_appointment_cleaning(self):
         assert intent("I need a cleaning") == Workflow.BOOK_APPOINTMENT

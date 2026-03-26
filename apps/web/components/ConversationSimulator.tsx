@@ -7,24 +7,40 @@ import SMSHeader from "./SMSHeader";
 import SMSBubble from "./SMSBubble";
 import SMSTypingIndicator from "./SMSTypingIndicator";
 import SMSInputBar from "./SMSInputBar";
-import { conversationSteps, Message } from "@/data/conversationFlows";
+import { sendMessage, WorkflowState } from "@/lib/chatApi";
 
-interface DisplayMessage extends Message {
-  stepId: string;
+// ── Types ───────────────────────────────────────────────────────────────────
+
+interface ChatMessage {
+  id: string;
+  sender: "clinic" | "patient";
+  text: string;
 }
 
-const ConversationSimulator = () => {
-  const [messages, setMessages] = useState<DisplayMessage[]>([]);
-  const [currentStepId, setCurrentStepId] = useState("start");
-  const [isTyping, setIsTyping] = useState(false);
-  const [isEnded, setIsEnded] = useState(false);
-  const [pendingMessages, setPendingMessages] = useState<{
-    msgs: Message[];
-    stepId: string;
-  } | null>(null);
+function makeId(): string {
+  return typeof crypto !== "undefined"
+    ? crypto.randomUUID()
+    : Math.random().toString(36).slice(2);
+}
 
+// ── Component ───────────────────────────────────────────────────────────────
+
+const ConversationSimulator = () => {
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [chatState, setChatState] = useState<WorkflowState | null>(null);
+  const [isTyping, setIsTyping] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const sessionId = useRef<string>(makeId());
+  /** After Restart, first user message forces server-side new-thread sanitization. */
+  const newConversationFirstSend = useRef(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const msgCounter = useRef(0);
+
+  const nextId = () => {
+    msgCounter.current += 1;
+    return `msg-${msgCounter.current}`;
+  };
 
   const scrollToBottom = useCallback(() => {
     if (scrollRef.current) {
@@ -36,101 +52,101 @@ const ConversationSimulator = () => {
     scrollToBottom();
   }, [messages, isTyping, scrollToBottom]);
 
-  // Deliver pending messages one at a time with a typing delay
-  useEffect(() => {
-    if (!pendingMessages || pendingMessages.msgs.length === 0) return;
+  // ── API call helper ──────────────────────────────────────────────────────
 
-    const [next, ...rest] = pendingMessages.msgs;
-    const delay = next.delay ?? 800;
-
-    setIsTyping(true);
-
-    const timer = setTimeout(() => {
-      setIsTyping(false);
-      msgCounter.current += 1;
-      const displayMsg: DisplayMessage = {
-        ...next,
-        id: `msg-${msgCounter.current}`,
-        stepId: pendingMessages.stepId,
-      };
-      setMessages((prev) => [...prev, displayMsg]);
-
-      if (rest.length > 0) {
-        setPendingMessages({ msgs: rest, stepId: pendingMessages.stepId });
-      } else {
-        setPendingMessages(null);
-        const step = conversationSteps[pendingMessages.stepId];
-        if (step?.isEnd) {
-          setIsEnded(true);
+  const callApi = useCallback(
+    async (userText: string, isOpening = false) => {
+      setIsTyping(true);
+      setError(null);
+      try {
+        const flagNew = newConversationFirstSend.current;
+        if (flagNew) {
+          newConversationFirstSend.current = false;
         }
+        const data = await sendMessage({
+          session_id: sessionId.current,
+          message: userText,
+          // Opening must never echo prior workflow state (avoids stale React closure).
+          state: isOpening ? null : chatState,
+          is_session_opening: isOpening,
+          new_conversation: flagNew && !isOpening,
+        });
+
+        setChatState(data.state);
+
+        // The reply may be multi-line; render it as one bubble
+        setMessages((prev) => [
+          ...prev,
+          { id: nextId(), sender: "clinic", text: data.reply },
+        ]);
+      } catch (err) {
+        const msg =
+          err instanceof Error ? err.message : "Something went wrong.";
+        setError(msg);
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: nextId(),
+            sender: "clinic",
+            text: "Sorry, I'm having trouble connecting right now. Please try again in a moment.",
+          },
+        ]);
+      } finally {
+        setIsTyping(false);
       }
-    }, delay);
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [chatState]
+  );
 
-    return () => clearTimeout(timer);
-  }, [pendingMessages]);
+  // ── Opening SMS on mount ─────────────────────────────────────────────────
 
-  // Kick off the opening message
   useEffect(() => {
-    const step = conversationSteps["start"];
-    if (step) {
-      setPendingMessages({ msgs: step.messages, stepId: "start" });
-    }
+    callApi("", true);
+    // Run once on mount only
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // ── User sends a message ─────────────────────────────────────────────────
+
   const handleSend = (text: string) => {
-    if (isEnded || isTyping) return;
+    if (isTyping) return;
 
-    msgCounter.current += 1;
-    const patientMsg: DisplayMessage = {
-      id: `msg-${msgCounter.current}`,
-      sender: "patient",
-      text,
-      timestamp: "",
-      stepId: currentStepId,
-    };
-    setMessages((prev) => [...prev, patientMsg]);
+    // Append the patient bubble immediately
+    setMessages((prev) => [
+      ...prev,
+      { id: nextId(), sender: "patient", text },
+    ]);
 
-    const currentStep = conversationSteps[currentStepId];
-    let nextStepId = currentStep?.nextStep;
-
-    if (currentStep?.nextStepMap) {
-      nextStepId =
-        currentStep.nextStepMap[text] ?? Object.values(currentStep.nextStepMap)[0];
-    }
-
-    if (nextStepId && conversationSteps[nextStepId]) {
-      setCurrentStepId(nextStepId);
-      setPendingMessages({
-        msgs: conversationSteps[nextStepId].messages,
-        stepId: nextStepId,
-      });
-    }
+    callApi(text);
   };
+
+  // ── Restart ──────────────────────────────────────────────────────────────
 
   const handleReset = () => {
     setMessages([]);
-    setCurrentStepId("start");
+    setChatState(null);
+    setError(null);
     setIsTyping(false);
-    setIsEnded(false);
-    setPendingMessages(null);
     msgCounter.current = 0;
+    sessionId.current = makeId();
+    newConversationFirstSend.current = true;
 
-    setTimeout(() => {
-      const step = conversationSteps["start"];
-      if (step) {
-        setPendingMessages({ msgs: step.messages, stepId: "start" });
-      }
-    }, 300);
+    // Small delay so state is cleared before the opening call fires
+    setTimeout(() => callApi("", true), 100);
   };
+
+  // ── Render ───────────────────────────────────────────────────────────────
 
   return (
     <>
       <button
         type="button"
         onClick={handleReset}
+        disabled={isTyping}
         className="fixed top-3 right-3 z-50 flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-medium
                    bg-background/90 text-muted-foreground shadow-sm border border-border/60 backdrop-blur-sm
-                   hover:bg-muted hover:text-foreground transition-colors"
+                   hover:bg-muted hover:text-foreground disabled:opacity-40 transition-colors"
         aria-label="Restart conversation"
       >
         <RotateCcw className="h-3.5 w-3.5" />
@@ -140,29 +156,35 @@ const ConversationSimulator = () => {
       <PhoneFrame>
         <SMSHeader />
 
-        {/* Messages area — scrolls inside the thread only, not the page */}
+        {/* Thread — only this div scrolls */}
         <div
           ref={scrollRef}
           className="flex-1 min-h-0 overflow-y-auto py-2 space-y-[2px]"
-          style={{ scrollBehavior: "smooth", WebkitOverflowScrolling: "touch" } as React.CSSProperties}
+          style={
+            {
+              scrollBehavior: "smooth",
+              WebkitOverflowScrolling: "touch",
+            } as React.CSSProperties
+          }
         >
           <div className="text-center text-[10px] text-sms-timestamp font-medium mb-2">
-            Today 2:34 PM
+            Today {new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
           </div>
 
           {messages.map((msg) => (
-            <SMSBubble
-              key={msg.id}
-              text={msg.text}
-              sender={msg.sender}
-              timestamp={msg.timestamp || undefined}
-            />
+            <SMSBubble key={msg.id} text={msg.text} sender={msg.sender} />
           ))}
 
           {isTyping && <SMSTypingIndicator />}
+
+          {error && (
+            <p className="text-center text-[11px] text-destructive px-4 py-1">
+              {error}
+            </p>
+          )}
         </div>
 
-        <SMSInputBar onSend={handleSend} disabled={isEnded || isTyping} />
+        <SMSInputBar onSend={handleSend} disabled={isTyping} />
       </PhoneFrame>
     </>
   );

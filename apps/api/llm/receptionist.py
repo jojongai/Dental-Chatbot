@@ -26,6 +26,7 @@ If Gemini is unavailable the router falls back to a plain-text formatter.
 from __future__ import annotations
 
 import logging
+import re
 
 from schemas.tools import GetClinicInfoOutput
 
@@ -36,16 +37,22 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _SYSTEM_PROMPT = """\
-You are Maya, a dental receptionist at Bright Smile Dental, replying via SMS to a patient whose call was missed.
-Always identify yourself as Maya from Bright Smile Dental — every message should feel like it is coming from a named person, not a bot.
-Your role is to answer their question using ONLY the clinic information provided — never invent facts or prices.
+You are Maya, a dental receptionist at Bright Smile Dental, replying via SMS.
+Your role is to answer using ONLY the clinic information provided — never invent facts or prices.
+
+Conversation threading (critical):
+- The patient already received an opening text from Maya. Do NOT start replies with a full re-introduction
+  like "Hi, this is Maya from Bright Smile Dental" or "Hi there, Maya from..." on every turn. Sound like you are
+  continuing the same text thread.
+- Do NOT end every message with a signature line like "- Maya" or "Anything else? - Maya." Use a short closing
+  question only when it fits (e.g. "Anything else I can help with?") and without repeating your name each time.
+  Reserve signing off as "- Maya" for a natural closing or goodbye, not after every answer.
 
 SMS formatting rules (strictly enforced):
 - Plain text only. No asterisks, no pound signs, no bullet symbols, no markdown of any kind.
 - Numbers are fine for lists (1. 2. 3.) but keep lists to 3 items maximum.
 - Keep the entire reply to 3 sentences or fewer for simple questions.
 - Never use em-dashes (—) or special Unicode characters that may not render on all phones.
-- End with one short offer to help further, e.g. "Anything else I can help with? - Maya"
 
 Tone rules:
 - Warm, reassuring, and professional — many callers are anxious about dental visits.
@@ -76,7 +83,8 @@ def answer_general_inquiry(
     pricing_options:
         Optional list of PricingOption ORM objects for self-pay questions.
     is_first_message:
-        When True, Gemini is instructed to open with a missed-call acknowledgement.
+        When True, this is the first reply you generate after the canned opening SMS (patient may say "yes" etc.).
+        The model is told not to repeat the full Maya intro from that opening text.
 
     Returns
     -------
@@ -87,7 +95,7 @@ def answer_general_inquiry(
 
     if not get_settings().use_llm:
         logger.debug("USE_LLM=false — skipping Gemini, using plain fallback.")
-        return _plain_fallback(clinic_data, pricing_options, is_first_message)
+        return _plain_fallback(clinic_data, pricing_options, is_first_message, user_message)
 
     context = _build_context(clinic_data, pricing_options)
     prompt = _build_prompt(user_message, context, is_first_message)
@@ -98,7 +106,7 @@ def answer_general_inquiry(
         return generate(prompt)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Gemini unavailable, falling back to plain formatter: %s", exc)
-        return _plain_fallback(clinic_data, pricing_options, is_first_message)
+        return _plain_fallback(clinic_data, pricing_options, is_first_message, user_message)
 
 
 # ---------------------------------------------------------------------------
@@ -147,17 +155,40 @@ def _build_context(
     return "\n".join(lines)
 
 
+_PATIENT_TYPE_ONLY_RE = re.compile(
+    r"^\s*(i'?m\s+(a\s+)?|i\s+am\s+(a\s+)?)?(new|existing)\s+(patient|here|customer)?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _is_patient_type_only(message: str) -> bool:
+    """Return True when the message is only a patient-type signal with no action intent."""
+    return bool(_PATIENT_TYPE_ONLY_RE.match(message.strip()))
+
+
 def _build_prompt(user_message: str, context: str, is_first_message: bool = False) -> str:
     opening_note = (
-        "This is the patient's first message after a missed call. "
-        "Open with one warm sentence acknowledging that we missed their call, "
-        "then answer their question.\n\n"
+        "This is your first reply in this SMS thread. The opening text already introduced Maya from "
+        "Bright Smile Dental and mentioned the missed call — do NOT repeat that full introduction. "
+        "If their message is short or vague (e.g. yes, hi, ok), acknowledge in one short phrase and ask "
+        "how you can help. Otherwise answer directly. Do not sign with '- Maya' at the end.\n\n"
         if is_first_message
+        else (
+            "Ongoing conversation: answer the question directly in a warm tone. No greeting that re-states "
+            "your name and clinic. No '- Maya' signature unless you are naturally closing the conversation.\n\n"
+        )
+    )
+    patient_type_note = (
+        "The patient has only identified themselves as new or existing — they have NOT yet "
+        "stated what they need. Do NOT dump clinic information. Simply acknowledge them warmly "
+        "and ask how you can help today (one sentence).\n\n"
+        if _is_patient_type_only(user_message)
         else ""
     )
     return (
         f"{_SYSTEM_PROMPT}\n\n"
         f"{opening_note}"
+        f"{patient_type_note}"
         f"=== CLINIC INFORMATION ===\n{context}\n"
         f"=== END OF CLINIC INFORMATION ===\n\n"
         f"Patient message: {user_message}\n\n"
@@ -174,12 +205,17 @@ def _plain_fallback(
     data: GetClinicInfoOutput,
     pricing_options: list | None,
     is_first_message: bool = False,
+    user_message: str = "",
 ) -> str:
     """Return a plain-text, SMS-safe answer when Gemini is unavailable."""
     parts: list[str] = []
 
     if is_first_message:
         parts.append("Hey, this is Maya from Bright Smile Dental - sorry we missed your call!")
+
+    if user_message and _is_patient_type_only(user_message):
+        parts.append("How can I help you today?")
+        return "\n".join(parts)
 
     if data.settings:
         s = data.settings
@@ -208,6 +244,9 @@ def _plain_fallback(
             parts.append(f"{i}. {p.name}{price_str}: {p.description}")
 
     phone = data.settings.phone_number if data.settings else "(416) 555-0100"
-    parts.append(f"Anything else I can help with? You can also call us at {phone}. - Maya")
+    if is_first_message:
+        parts.append(f"Anything else I can help with? You can also call us at {phone}. - Maya")
+    else:
+        parts.append(f"Anything else I can help with? Call us at {phone} if you prefer.")
 
     return "\n".join(parts)

@@ -3,7 +3,8 @@ Field and workflow definitions.
 
 A FieldDef describes one piece of data the chatbot needs to collect:
   - what to ask the user
-  - which extractor to use
+  - a natural-language description fed to the LLM interpreter
+  - which extractor to run (only for deterministic / high-confidence fields)
 
 A WorkflowDef describes a complete chatbot workflow:
   - ordered required fields (the machine asks for them in this order)
@@ -11,10 +12,15 @@ A WorkflowDef describes a complete chatbot workflow:
   - which tool to call when all required fields are present
   - whether to pause for confirmation before calling the tool
 
-Every workflow also declares a `sub_workflow` — when the primary workflow
-needs patient identity first (e.g. book_appointment needs patient_id), the
-machine switches to `existing_patient_verification` as a sub-workflow and
-resumes the parent when verification succeeds.
+Field taxonomy
+--------------
+Deterministic fields — extractor is set; regex is reliable and high-confidence:
+  first_name / last_name, phone_number, date_of_birth, email, confirmation
+
+Semantic fields — extractor is None; the LLM interpreter handles these because
+  they need contextual understanding (e.g. "no insurance", "next Tuesday",
+  "my tooth is killing me"). The regex fallbacks still exist in extractors.py
+  and are used by the interpreter's USE_LLM=false keyword path.
 """
 
 from __future__ import annotations
@@ -23,20 +29,12 @@ from dataclasses import dataclass, field
 
 from schemas.chat import Workflow
 from state_machine.extractors import (
-    extract_appointment_type,
-    extract_cancel_reason,
     extract_confirmation,
     extract_dob,
     extract_email,
-    extract_emergency_summary,
-    extract_family_count,
     extract_full_name,
-    extract_group_preference,
-    extract_insurance,
     extract_last_name,
     extract_phone,
-    extract_preferred_date,
-    extract_time_of_day,
 )
 
 # ---------------------------------------------------------------------------
@@ -49,21 +47,30 @@ class FieldDef:
     key: str
     display_name: str
     prompt: str
-    # Extractor function; returns a scalar, dict, or None.
-    # If it returns a dict, each key in the dict is merged into collected_fields.
-    extractor: object  # Callable[[str], Any | None]
+    # Natural-language description fed into the LLM interpreter prompt.
+    description: str
+    # Regex/heuristic extractor. None for semantic fields (interpreter handles them).
+    extractor: object | None = None  # Callable[[str], Any | None]
     optional: bool = False
-    # True when this extractor returns {'first_name':…, 'last_name':…} instead of a scalar
+    # True when this extractor returns {'first_name':…, 'last_name':…} instead of a scalar.
     multi_key: bool = False
 
 
 # --- individual field definitions ---
 
 FIELDS: dict[str, FieldDef] = {
+    # ------------------------------------------------------------------
+    # Deterministic fields — extractor set, regex is reliable
+    # ------------------------------------------------------------------
     "first_name": FieldDef(
         key="first_name",
         display_name="first name",
         prompt="What's your full name?",
+        description=(
+            "The patient's first name and last name. "
+            "Look for any phrase that introduces a person's name: "
+            "'I'm John Smith', 'My name is Alice', or just a bare two-word name."
+        ),
         extractor=extract_full_name,
         multi_key=True,  # also populates last_name
     ),
@@ -71,88 +78,154 @@ FIELDS: dict[str, FieldDef] = {
         key="last_name",
         display_name="last name",
         prompt="What's your last name?",
+        description="The patient's family/last name.",
         extractor=extract_last_name,
     ),
     "phone_number": FieldDef(
         key="phone_number",
         display_name="phone number",
         prompt="What's a good number to reach you at?",
+        description=(
+            "A 10-digit North American phone number. "
+            "Accept any common format: 647-638-5400, (647) 638-5400, 6476385400."
+        ),
         extractor=extract_phone,
     ),
     "date_of_birth": FieldDef(
         key="date_of_birth",
         display_name="date of birth",
-        prompt="What's your date of birth? (like March 14, 1985)",
+        prompt="What's your date of birth?",
+        description=(
+            "The patient's date of birth as a date. "
+            "Accepts formats like 'August 28, 2003', '08/28/2003', '2003-08-28'."
+        ),
         extractor=extract_dob,
-    ),
-    "insurance_name": FieldDef(
-        key="insurance_name",
-        display_name="insurance provider",
-        prompt="Do you have dental insurance? If so, which provider? "
-        "No worries if you don't — just say 'no insurance'!",
-        extractor=extract_insurance,
-        optional=True,
-    ),
-    "appointment_type": FieldDef(
-        key="appointment_type",
-        display_name="appointment type",
-        prompt="What kind of appointment are you looking for? "
-        "We do cleanings, check-ups, new patient exams, and emergency visits.",
-        extractor=extract_appointment_type,
-    ),
-    "preferred_date_from": FieldDef(
-        key="preferred_date_from",
-        display_name="preferred date",
-        prompt="When works best for you? (like 'next week', 'April 5', etc.)",
-        extractor=extract_preferred_date,
-    ),
-    "preferred_time_of_day": FieldDef(
-        key="preferred_time_of_day",
-        display_name="preferred time of day",
-        prompt="Any preference on time of day — morning, afternoon, or evening?",
-        extractor=extract_time_of_day,
-        optional=True,
-    ),
-    "emergency_summary": FieldDef(
-        key="emergency_summary",
-        display_name="emergency description",
-        prompt="Can you quickly describe what's going on? "
-        "Where's the pain, how bad on a scale of 1–10, and when did it start?",
-        extractor=extract_emergency_summary,
-    ),
-    "cancel_reason": FieldDef(
-        key="cancel_reason",
-        display_name="reason for cancellation",
-        prompt="Mind sharing why you need to cancel? (totally fine if it's just a scheduling thing)",
-        extractor=extract_cancel_reason,
-    ),
-    "group_preference": FieldDef(
-        key="group_preference",
-        display_name="scheduling preference",
-        prompt="How would you like to schedule everyone? "
-        "Back-to-back, same day, same provider, or just whatever's available?",
-        extractor=extract_group_preference,
-        optional=True,
-    ),
-    "family_count": FieldDef(
-        key="family_count",
-        display_name="number of family members",
-        prompt="How many people are we booking for?",
-        extractor=extract_family_count,
     ),
     "email": FieldDef(
         key="email",
         display_name="email address",
-        prompt="I found a couple of records that match — "
-        "could you share your email so I can find the right one?",
+        prompt=(
+            "I found a couple of records that match — "
+            "could you share your email so I can find the right one?"
+        ),
+        description="The patient's email address (used as a tiebreaker when duplicate records exist).",
         extractor=extract_email,
         optional=True,
     ),
     "confirmation": FieldDef(
         key="confirmation",
         display_name="confirmation",
-        prompt="Does everything look good? (just reply yes or no)",
+        prompt="Does everything look good?",
+        description=(
+            "Whether the patient is confirming (yes) or declining (no) the booking summary. "
+            "True = yes/confirmed; False = no/change something."
+        ),
         extractor=extract_confirmation,
+    ),
+
+    # ------------------------------------------------------------------
+    # Semantic fields — extractor=None, LLM interpreter handles extraction
+    # ------------------------------------------------------------------
+    "insurance_name": FieldDef(
+        key="insurance_name",
+        display_name="insurance provider",
+        prompt="Do you have dental insurance? If so, which provider? No worries if you don't.",
+        description=(
+            "The patient's dental insurance provider. "
+            "Return the provider name (e.g. 'Sun Life', 'MetLife') or 'self_pay' if they "
+            "have no insurance. Treat responses like 'No', 'Nope', 'I don't', "
+            "'pay out of pocket', 'not insured', 'covered through work' all as valid answers."
+        ),
+        extractor=None,
+        optional=True,
+    ),
+    "appointment_type": FieldDef(
+        key="appointment_type",
+        display_name="appointment type",
+        prompt="What kind of appointment are you looking for?",
+        description=(
+            "The type of dental appointment. Return exactly one of: "
+            "'cleaning' (hygiene, polish, scale), "
+            "'general_checkup' (check-up, routine exam, regular visit), "
+            "'new_patient_exam' (first visit, new patient, registration exam), "
+            "'emergency' (pain, broken/cracked tooth, abscess, swelling, urgent care)."
+        ),
+        extractor=None,
+    ),
+    "preferred_date_from": FieldDef(
+        key="preferred_date_from",
+        display_name="preferred date",
+        prompt="When works best for you?",
+        description=(
+            "The patient's preferred appointment date or time-frame. "
+            "Return an ISO date (YYYY-MM-DD) for exact dates, or a natural phrase "
+            "like 'next week', 'next Monday', 'sometime in April', 'as soon as possible' "
+            "for relative expressions. Must be a future date."
+        ),
+        extractor=None,
+    ),
+    "preferred_time_of_day": FieldDef(
+        key="preferred_time_of_day",
+        display_name="preferred time of day",
+        prompt="Any preference on time of day — morning, afternoon, or evening?",
+        description=(
+            "The patient's preferred time of day for their appointment. "
+            "Return exactly one of: 'morning', 'afternoon', 'evening'. "
+            "Map loosely: 'early' → morning; 'lunch'/'midday' → afternoon; "
+            "'after work'/'PM'/'late' → evening."
+        ),
+        extractor=None,
+        optional=True,
+    ),
+    "emergency_summary": FieldDef(
+        key="emergency_summary",
+        display_name="emergency description",
+        prompt=(
+            "Can you quickly describe what's going on? "
+            "Where's the pain, how bad on a scale of 1–10, and when did it start?"
+        ),
+        description=(
+            "A brief description of the dental emergency: location of pain, severity "
+            "on a 1–10 scale, and when it started. Capture the patient's own words "
+            "as a short free-text summary."
+        ),
+        extractor=None,
+    ),
+    "cancel_reason": FieldDef(
+        key="cancel_reason",
+        display_name="reason for cancellation",
+        prompt="Mind sharing why you need to cancel?",
+        description=(
+            "The patient's reason for cancelling their appointment. "
+            "Accept any free-text answer; return a short summary. "
+            "If they don't give a reason, return 'Patient request'."
+        ),
+        extractor=None,
+    ),
+    "group_preference": FieldDef(
+        key="group_preference",
+        display_name="scheduling preference",
+        prompt=(
+            "How would you like to schedule everyone? "
+            "Back-to-back, same day, same provider, or just whatever's available?"
+        ),
+        description=(
+            "Scheduling preference for a family/group booking. "
+            "Return one of: 'back_to_back', 'same_day', 'same_provider', 'any'. "
+            "Map phrases like 'doesn't matter' or 'whatever works' to 'any'."
+        ),
+        extractor=None,
+        optional=True,
+    ),
+    "family_count": FieldDef(
+        key="family_count",
+        display_name="number of family members",
+        prompt="How many people are we booking for?",
+        description=(
+            "The number of family members / people to book appointments for. "
+            "Return an integer. Accept digit words: 'two' → 2, 'three' → 3, etc."
+        ),
+        extractor=None,
     ),
 }
 
@@ -204,8 +277,6 @@ WORKFLOWS: dict[Workflow, WorkflowDef] = {
     ),
     # ------------------------------------------------------------------
     # New patient registration
-    # Collect: name, phone, DOB, insurance (optional), appointment type, date
-    # Tool: create_patient  (then search_slots in next step)
     # ------------------------------------------------------------------
     Workflow.NEW_PATIENT_REGISTRATION: WorkflowDef(
         workflow=Workflow.NEW_PATIENT_REGISTRATION,
@@ -226,11 +297,6 @@ WORKFLOWS: dict[Workflow, WorkflowDef] = {
     ),
     # ------------------------------------------------------------------
     # Existing patient verification
-    # Collect: first_name + last_name (via multi_key full-name extractor) + phone_number
-    # first_name prompt asks for full name → populates both first_name and last_name.
-    # phone_number may already be pre-filled from caller ID, so often only one question needed.
-    # email is optional — only asked if two records share the same name + phone (edge case).
-    # Tool: lookup_patient
     # ------------------------------------------------------------------
     Workflow.EXISTING_PATIENT_VERIFICATION: WorkflowDef(
         workflow=Workflow.EXISTING_PATIENT_VERIFICATION,
@@ -243,9 +309,6 @@ WORKFLOWS: dict[Workflow, WorkflowDef] = {
     ),
     # ------------------------------------------------------------------
     # Book appointment (existing patient)
-    # Requires patient_id — machine runs verification sub-workflow first if absent.
-    # Collect: appointment_type, preferred date
-    # Tool: search_slots  (then book_appointment after slot selection)
     # ------------------------------------------------------------------
     Workflow.BOOK_APPOINTMENT: WorkflowDef(
         workflow=Workflow.BOOK_APPOINTMENT,
@@ -262,15 +325,10 @@ WORKFLOWS: dict[Workflow, WorkflowDef] = {
     ),
     # ------------------------------------------------------------------
     # Reschedule appointment
-    # Requires patient_id + appointment_id (appointment_id set after patient lookup
-    # shows their upcoming appointments and they select one).
-    # Collect: preferred_date_from, optional time_of_day
-    # Tool: search_slots  (then reschedule_appointment after slot selection)
     # ------------------------------------------------------------------
     Workflow.RESCHEDULE_APPOINTMENT: WorkflowDef(
         workflow=Workflow.RESCHEDULE_APPOINTMENT,
         display_name="Reschedule Appointment",
-        # appointment_id is set programmatically after showing the patient their bookings.
         required_fields=["preferred_date_from"],
         optional_fields=["preferred_time_of_day"],
         tool_name="search_slots",
@@ -280,9 +338,6 @@ WORKFLOWS: dict[Workflow, WorkflowDef] = {
     ),
     # ------------------------------------------------------------------
     # Cancel appointment
-    # Requires patient_id + appointment_id (set after lookup + selection).
-    # Collect: cancel_reason, confirmation
-    # Tool: cancel_appointment
     # ------------------------------------------------------------------
     Workflow.CANCEL_APPOINTMENT: WorkflowDef(
         workflow=Workflow.CANCEL_APPOINTMENT,
@@ -297,9 +352,6 @@ WORKFLOWS: dict[Workflow, WorkflowDef] = {
     ),
     # ------------------------------------------------------------------
     # Family booking
-    # Collect: family count + each member's appointment type, date range,
-    # and optional group preference.
-    # Tool: book_family_appointments
     # ------------------------------------------------------------------
     Workflow.FAMILY_BOOKING: WorkflowDef(
         workflow=Workflow.FAMILY_BOOKING,
@@ -314,9 +366,6 @@ WORKFLOWS: dict[Workflow, WorkflowDef] = {
     ),
     # ------------------------------------------------------------------
     # Emergency triage
-    # Collect: name, phone, emergency_summary
-    # Tool: create_staff_notification (urgent) — staff are notified immediately.
-    # Slot booking handled in a second step after staff acknowledgement.
     # ------------------------------------------------------------------
     Workflow.EMERGENCY_TRIAGE: WorkflowDef(
         workflow=Workflow.EMERGENCY_TRIAGE,
@@ -337,7 +386,6 @@ WORKFLOWS: dict[Workflow, WorkflowDef] = {
     ),
     # ------------------------------------------------------------------
     # Handoff — explicit escalation to human staff
-    # No tool; just acknowledge and create a staff notification.
     # ------------------------------------------------------------------
     Workflow.HANDOFF: WorkflowDef(
         workflow=Workflow.HANDOFF,

@@ -26,11 +26,15 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _WORKFLOW_DESCRIPTIONS = """
-new_patient_registration  — caller is a brand new patient who has never visited before,
-                            wants to register and/or book their first appointment.
-                            Examples: "I've never been there before", "I'm new",
-                            "never been a patient", "I'd like to become a patient",
-                            "want to sign up", "first visit"
+new_patient_registration  — caller is a brand new patient who wants to register AND
+                            shows some action intent (register, book, sign up, first visit).
+                            Just saying "new patient" or "I'm new" WITHOUT an action word
+                            is NOT enough — that should be classified as general_inquiry.
+                            Examples: "I'm a new patient and want to book",
+                            "never been there before, want to sign up",
+                            "first time patient, need a cleaning",
+                            "want to register as a new patient"
+                            NOT: "new patient" alone, "I'm new", "existing patient"
 
 book_appointment          — existing patient who wants to schedule, book, or
                             make an appointment. Also triggers when someone says
@@ -149,6 +153,15 @@ def classify_intent(message: str, fallback_fn=None) -> Workflow:
     if not settings.use_llm:
         return _keyword_fallback(message, fallback_fn)
 
+    # Fast path: if the keyword map produces a confident non-ambiguous result,
+    # return it immediately without an API call.  The LLM is reserved for
+    # messages where keyword matching returns the GENERAL_INQUIRY fallback —
+    # meaning there is no clear trigger and the message is genuinely ambiguous.
+    keyword_result = _keyword_fallback(message)
+    if keyword_result != Workflow.GENERAL_INQUIRY:
+        logger.debug("fast-path intent (keyword): %r → %s", message[:60], keyword_result)
+        return keyword_result
+
     try:
         from llm.gemini import get_client, _model_name
         from google.genai import types as genai_types
@@ -189,8 +202,12 @@ _KEYWORD_MAP: list[tuple[list[str], Workflow]] = [
          "abscess", "swollen", "knocked out", "toothache", "bleeding gum"],
         Workflow.EMERGENCY_TRIAGE,
     ),
+    # "new patient" alone is a patient-type signal, not a workflow intent.
+    # Require an action word alongside it (handled by the LLM path).
+    # Keyword-only path still fires for unambiguous action phrases.
     (
-        ["new patient", "register", "first time", "first visit", "sign up"],
+        ["register", "first visit", "first time", "sign up", "first appointment",
+         "never been", "never visited"],
         Workflow.NEW_PATIENT_REGISTRATION,
     ),
     (
@@ -203,10 +220,6 @@ _KEYWORD_MAP: list[tuple[list[str], Workflow]] = [
         ["family", "kids", "children", "my kid", "spouse",
          "husband", "wife", "son", "daughter", "partner"],
         Workflow.FAMILY_BOOKING,
-    ),
-    (
-        ["existing patient", "already a patient", "been a patient"],
-        Workflow.BOOK_APPOINTMENT,  # triggers EXISTING_PATIENT_VERIFICATION sub-workflow
     ),
     (
         ["book", "schedule", "appointment", "cleaning", "checkup",
