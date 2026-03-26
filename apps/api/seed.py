@@ -64,13 +64,20 @@ def generate_slots(
     start_date: date,
     days: int = 14,
 ) -> list[AppointmentSlot]:
-    """Generate 1-hour available slots Mon-Fri 9 AM–5 PM for `days` calendar days."""
+    """
+    Generate 1-hour available slots for the next `days` calendar days.
+    Mon–Fri: 8 AM – 6 PM  (10 slots/day)
+    Sat:     9 AM – 2 PM  ( 5 slots/day)
+    Sun:     closed
+    """
     slots = []
     for offset in range(days):
         day = start_date + timedelta(days=offset)
-        if day.weekday() >= 5:  # skip weekends
+        weekday = day.weekday()  # 0=Mon … 6=Sun
+        if weekday == 6:  # Sunday closed
             continue
-        for hour in range(9, 17):
+        hour_range = range(9, 14) if weekday == 5 else range(8, 18)  # Sat 9–14, else 8–18
+        for hour in hour_range:
             starts = datetime(day.year, day.month, day.day, hour, 0, tzinfo=TZ)
             ends = starts + timedelta(hours=1)
             slots.append(
@@ -135,33 +142,26 @@ def seed() -> None:
         # ------------------------------------------------------------------
         # Location hours  (Mon–Fri 8am–6pm, Sat 9am–2pm, Sun closed)
         # ------------------------------------------------------------------
-        weekday_schedule = [
-            (0, False, time(9, 0), time(17, 0)),  # Sun closed
-            (1, False, time(8, 0), time(18, 0)),  # Mon
-            (2, False, time(8, 0), time(18, 0)),  # Tue
-            (3, False, time(8, 0), time(18, 0)),  # Wed
-            (4, False, time(8, 0), time(18, 0)),  # Thu
-            (5, False, time(8, 0), time(18, 0)),  # Fri
-            (6, False, time(9, 0), time(14, 0)),  # Sat
+        # day_of_week: 0=Sun, 1=Mon … 6=Sat
+        location_schedule = [
+            (0, True, None, None),  # Sun — closed
+            (1, False, time(8, 0), time(18, 0)),  # Mon 8–6
+            (2, False, time(8, 0), time(18, 0)),  # Tue 8–6
+            (3, False, time(8, 0), time(18, 0)),  # Wed 8–6
+            (4, False, time(8, 0), time(18, 0)),  # Thu 8–6
+            (5, False, time(8, 0), time(18, 0)),  # Fri 8–6
+            (6, False, time(9, 0), time(14, 0)),  # Sat 9–2
         ]
-        for dow, closed, open_t, close_t in weekday_schedule:
+        for dow, closed, open_t, close_t in location_schedule:
             db.add(
                 LocationHours(
                     location_id=location.id,
                     day_of_week=dow,
                     is_closed=closed,
-                    open_time=None if closed else open_t,
-                    close_time=None if closed else close_t,
+                    open_time=open_t,
+                    close_time=close_t,
                 )
             )
-        # Sunday override — closed
-        db.add(
-            LocationHours(
-                location_id=location.id,
-                day_of_week=0,
-                is_closed=True,
-            )
-        )
 
         # ------------------------------------------------------------------
         # Operatories
@@ -294,35 +294,74 @@ def seed() -> None:
         db.flush()
 
         # ------------------------------------------------------------------
-        # Insurance plans
+        # Insurance plans — Canadian and US major carriers
         # ------------------------------------------------------------------
-        plans = [
-            InsurancePlan(
+
+        # Helper so we don't repeat practice_id on every row
+        def plan(carrier: str, plan_name: str, plan_code: str | None = None, notes: str | None = None) -> InsurancePlan:
+            return InsurancePlan(
                 practice_id=practice.id,
-                carrier_name="Sun Life",
-                plan_name="Sun Life Dental Plus",
+                carrier_name=carrier,
+                plan_name=plan_name,
+                plan_code=plan_code,
                 acceptance_status="accepted",
+                notes=notes,
+            )
+
+        canadian_plans = [
+            # Sun Life Financial — also administers the federal CDCP
+            plan("Sun Life Financial", "Sun Life Personal Health Insurance (PHI)", "SL-PHI"),
+            plan("Sun Life Financial", "Sun Life FollowMe Dental", "SL-FM"),
+            plan(
+                "Sun Life Financial",
+                "Canadian Dental Care Plan (CDCP)",
+                "SL-CDCP",
+                "Government-subsidised plan for uninsured residents with household income < $90 000. "
+                "Administered by Sun Life. Launched 2024, expanding 2025–2026.",
             ),
-            InsurancePlan(
-                practice_id=practice.id,
-                carrier_name="Manulife",
-                plan_name="Manulife FlexCare Dental",
-                acceptance_status="accepted",
-            ),
-            InsurancePlan(
-                practice_id=practice.id,
-                carrier_name="Great-West Life",
-                plan_name="GWL Dental Extended",
-                acceptance_status="accepted",
-            ),
-            InsurancePlan(
-                practice_id=practice.id,
-                carrier_name="Desjardins",
-                plan_name="Desjardins Group Dental",
-                acceptance_status="accepted",
-            ),
+            # Manulife
+            plan("Manulife", "Manulife Flexcare Dental", "MAN-FLEX"),
+            plan("Manulife", "Manulife FollowMe Dental", "MAN-FM"),
+            # Green Shield Canada
+            plan("Green Shield Canada (GSC)", "GreenShield ZONE", "GSC-ZONE"),
+            plan("Green Shield Canada (GSC)", "GreenShield LINK", "GSC-LINK"),
+            # Canada Life (formerly Great-West Life)
+            plan("Canada Life", "Freedom to Choose Health & Dental", "CL-FTC"),
+            plan("Canada Life", "Canada Life Group Dental", "CL-GRP"),
+            # Medavie Blue Cross / Pacific Blue Cross
+            plan("Medavie Blue Cross", "Medavie Blue Cross Dental", "MBC-DNTL"),
+            plan("Pacific Blue Cross", "Pacific Blue Cross Dental", "PBC-DNTL"),
+            # Desjardins
+            plan("Desjardins Insurance", "Desjardins Basic Dental", "DJ-BASIC"),
+            plan("Desjardins Insurance", "Desjardins Enhanced Dental", "DJ-ENH"),
+            # RBC Insurance
+            plan("RBC Insurance", "RBC Dental Care Insurance", "RBC-DNTL"),
+            plan("RBC Insurance", "RBC Group Benefits Dental", "RBC-GRP"),
+            # GMS (Group Medical Services)
+            plan("GMS (Group Medical Services)", "GMS BasicPlan Dental", "GMS-BASIC"),
+            plan("GMS (Group Medical Services)", "GMS ExtendaPlan Dental", "GMS-EXT"),
+            plan("GMS (Group Medical Services)", "GMS OmniPlan Dental", "GMS-OMNI"),
         ]
-        db.add_all(plans)
+
+        us_plans = [
+            plan("Delta Dental", "Delta Dental PPO", "DD-PPO"),
+            plan("Delta Dental", "Delta Dental Premier", "DD-PREMIER"),
+            plan("MetLife", "MetLife Preferred Dentist Program (PDP)", "MET-PDP"),
+            plan("Cigna Dental", "Cigna Dental 1500", "CIG-1500"),
+            plan("Cigna Dental", "Cigna Dental 3000", "CIG-3000"),
+            plan("UnitedHealthcare", "UHC Dental Gold", "UHC-GOLD"),
+            plan("UnitedHealthcare", "UHC Dental Silver", "UHC-SILV"),
+            plan("Guardian Life Insurance", "Guardian DentalGuard Preferred", "GRD-PREF"),
+            plan("Humana", "Humana Extend 2500", "HUM-EXT"),
+            plan("Humana", "Humana Complete Dental", "HUM-COMP"),
+            plan("Ameritas", "Ameritas PrimeStar Dental", "AMR-PS"),
+            plan("United Concordia", "United Concordia Flex Plan", "UC-FLEX"),
+            plan("Aetna", "Aetna Dental Direct", "AET-DRTL"),
+            plan("Aetna", "Aetna Vital Savings", "AET-VS"),
+            plan("Aflac", "Aflac Dental Supplement", "AFL-SUPP"),
+        ]
+
+        db.add_all(canadian_plans + us_plans)
         db.flush()
 
         # ------------------------------------------------------------------
@@ -377,12 +416,13 @@ def seed() -> None:
             )
         )
 
-        # Insurance policy for existing patient
+        # Insurance policy for existing patient — Sun Life PHI
+        sun_life_phi = canadian_plans[0]  # "Sun Life Personal Health Insurance (PHI)"
         db.add(
             PatientInsurancePolicy(
                 patient_id=patient_existing.id,
-                insurance_plan_id=plans[0].id,
-                provider_name="Sun Life",
+                insurance_plan_id=sun_life_phi.id,
+                provider_name="Sun Life Financial",
                 member_id="SL-887766",
                 group_number="GRP-4455",
                 policy_holder_name="Alice Thompson",
@@ -627,8 +667,7 @@ def seed() -> None:
                     name="Bright Smile Membership",
                     pricing_type="membership",
                     description=(
-                        "Annual membership: 2 cleanings, 2 exams, 1 set of X-rays, 10% off all "
-                        "additional treatments."
+                        "Annual membership: 2 cleanings, 2 exams, 1 set of X-rays, 10% off all additional treatments."
                     ),
                     base_price=399.00,
                     is_active=True,

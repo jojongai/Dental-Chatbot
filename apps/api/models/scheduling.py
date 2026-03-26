@@ -37,9 +37,7 @@ class AppointmentType(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
     slots: Mapped[list[AppointmentSlot]] = relationship("AppointmentSlot", back_populates="appointment_type")
-    requests: Mapped[list[AppointmentRequest]] = relationship(
-        "AppointmentRequest", back_populates="appointment_type"
-    )
+    requests: Mapped[list[AppointmentRequest]] = relationship("AppointmentRequest", back_populates="appointment_type")
 
 
 class AppointmentSlot(Base, TimestampMixin):
@@ -64,9 +62,7 @@ class AppointmentSlot(Base, TimestampMixin):
     capacity: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
 
     appointment_type: Mapped[AppointmentType | None] = relationship("AppointmentType", back_populates="slots")
-    appointment: Mapped[Appointment | None] = relationship(
-        "Appointment", back_populates="slot", uselist=False
-    )
+    appointment: Mapped[Appointment | None] = relationship("Appointment", back_populates="slot", uselist=False)
 
 
 class AppointmentRequestGroup(Base, TimestampMixin):
@@ -85,9 +81,7 @@ class AppointmentRequestGroup(Base, TimestampMixin):
     request_status: Mapped[str] = mapped_column(Text, nullable=False, default="pending")
     notes: Mapped[str | None] = mapped_column(Text)
 
-    requests: Mapped[list[AppointmentRequest]] = relationship(
-        "AppointmentRequest", back_populates="request_group"
-    )
+    requests: Mapped[list[AppointmentRequest]] = relationship("AppointmentRequest", back_populates="request_group")
     appointments: Mapped[list[Appointment]] = relationship("Appointment", back_populates="appointment_group")
 
 
@@ -95,16 +89,12 @@ class AppointmentRequest(Base, TimestampMixin):
     __tablename__ = "appointment_requests"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
-    request_group_id: Mapped[str | None] = mapped_column(
-        String(36), ForeignKey("appointment_request_groups.id")
-    )
+    request_group_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("appointment_request_groups.id"))
     # NOTE: conversations table is defined in conversation.py; use string FK reference
     conversation_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("conversations.id"))
     patient_id: Mapped[str] = mapped_column(String(36), ForeignKey("patients.id"), nullable=False)
     location_id: Mapped[str] = mapped_column(String(36), ForeignKey("locations.id"), nullable=False)
-    appointment_type_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("appointment_types.id"), nullable=False
-    )
+    appointment_type_id: Mapped[str] = mapped_column(String(36), ForeignKey("appointment_types.id"), nullable=False)
     preferred_date_from: Mapped[date | None] = mapped_column(Date)
     preferred_date_to: Mapped[date | None] = mapped_column(Date)
     # morning | afternoon | evening | after_school | any
@@ -131,21 +121,15 @@ class Appointment(Base, TimestampMixin):
     __tablename__ = "appointments"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
-    appointment_request_id: Mapped[str | None] = mapped_column(
-        String(36), ForeignKey("appointment_requests.id")
-    )
-    appointment_group_id: Mapped[str | None] = mapped_column(
-        String(36), ForeignKey("appointment_request_groups.id")
-    )
+    appointment_request_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("appointment_requests.id"))
+    appointment_group_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("appointment_request_groups.id"))
     patient_id: Mapped[str] = mapped_column(String(36), ForeignKey("patients.id"), nullable=False)
     # unique: one slot → at most one appointment
     slot_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("appointment_slots.id"), unique=True)
     location_id: Mapped[str] = mapped_column(String(36), ForeignKey("locations.id"), nullable=False)
     provider_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("providers.id"))
     operatory_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("operatories.id"))
-    appointment_type_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("appointment_types.id"), nullable=False
-    )
+    appointment_type_id: Mapped[str] = mapped_column(String(36), ForeignKey("appointment_types.id"), nullable=False)
     # booked | confirmed | checked_in | completed | cancelled | no_show | rescheduled
     status: Mapped[str] = mapped_column(Text, nullable=False)
     # chatbot | staff | phone | walk_in
@@ -156,9 +140,7 @@ class Appointment(Base, TimestampMixin):
     special_instructions: Mapped[str | None] = mapped_column(Text)
     is_emergency: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     emergency_summary: Mapped[str | None] = mapped_column(Text)
-    rescheduled_from_appointment_id: Mapped[str | None] = mapped_column(
-        String(36), ForeignKey("appointments.id")
-    )
+    rescheduled_from_appointment_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("appointments.id"))
     cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     cancel_reason: Mapped[str | None] = mapped_column(Text)
     created_by_staff_user_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("staff_users.id"))

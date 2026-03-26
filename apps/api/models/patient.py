@@ -41,9 +41,7 @@ class Patient(Base, TimestampMixin):
     responsible_party_links: Mapped[list[PatientResponsibleParty]] = relationship(
         "PatientResponsibleParty", back_populates="patient"
     )
-    family_memberships: Mapped[list[FamilyGroupMember]] = relationship(
-        "FamilyGroupMember", back_populates="patient"
-    )
+    family_memberships: Mapped[list[FamilyGroupMember]] = relationship("FamilyGroupMember", back_populates="patient")
 
 
 class PatientAddress(Base):
@@ -85,9 +83,7 @@ class PatientResponsibleParty(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     patient_id: Mapped[str] = mapped_column(String(36), ForeignKey("patients.id"), nullable=False)
-    responsible_party_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("responsible_parties.id"), nullable=False
-    )
+    responsible_party_id: Mapped[str] = mapped_column(String(36), ForeignKey("responsible_parties.id"), nullable=False)
     # parent | guardian | spouse | self
     relationship_type: Mapped[str] = mapped_column(Text, nullable=False)
     is_primary_contact: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -96,9 +92,7 @@ class PatientResponsibleParty(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
     patient: Mapped[Patient] = relationship("Patient", back_populates="responsible_party_links")
-    responsible_party: Mapped[ResponsibleParty] = relationship(
-        "ResponsibleParty", back_populates="patient_links"
-    )
+    responsible_party: Mapped[ResponsibleParty] = relationship("ResponsibleParty", back_populates="patient_links")
 
 
 class FamilyGroup(Base, TimestampMixin):
@@ -113,9 +107,7 @@ class FamilyGroup(Base, TimestampMixin):
     )
     notes: Mapped[str | None] = mapped_column(Text)
 
-    members: Mapped[list[FamilyGroupMember]] = relationship(
-        "FamilyGroupMember", back_populates="family_group"
-    )
+    members: Mapped[list[FamilyGroupMember]] = relationship("FamilyGroupMember", back_populates="family_group")
 
 
 class FamilyGroupMember(Base):
@@ -168,6 +160,4 @@ class PatientInsurancePolicy(Base, TimestampMixin):
     verification_status: Mapped[str] = mapped_column(Text, nullable=False, default="unverified")
 
     patient: Mapped[Patient] = relationship("Patient", back_populates="insurance_policies")
-    insurance_plan: Mapped[InsurancePlan | None] = relationship(
-        "InsurancePlan", back_populates="patient_policies"
-    )
+    insurance_plan: Mapped[InsurancePlan | None] = relationship("InsurancePlan", back_populates="patient_policies")

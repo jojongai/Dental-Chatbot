@@ -31,15 +31,11 @@ class Conversation(Base, TimestampMixin):
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
-    messages: Mapped[list[ConversationMessage]] = relationship(
-        "ConversationMessage", back_populates="conversation"
-    )
+    messages: Mapped[list[ConversationMessage]] = relationship("ConversationMessage", back_populates="conversation")
     state_snapshots: Mapped[list[ConversationStateSnapshot]] = relationship(
         "ConversationStateSnapshot", back_populates="conversation"
     )
-    intents: Mapped[list[ConversationIntent]] = relationship(
-        "ConversationIntent", back_populates="conversation"
-    )
+    intents: Mapped[list[ConversationIntent]] = relationship("ConversationIntent", back_populates="conversation")
 
 
 class ConversationMessage(Base):
