@@ -17,7 +17,6 @@ const ConversationSimulator = () => {
   const [messages, setMessages] = useState<DisplayMessage[]>([]);
   const [currentStepId, setCurrentStepId] = useState("start");
   const [isTyping, setIsTyping] = useState(false);
-  const [choices, setChoices] = useState<string[]>([]);
   const [isEnded, setIsEnded] = useState(false);
   const [pendingMessages, setPendingMessages] = useState<{
     msgs: Message[];
@@ -63,8 +62,6 @@ const ConversationSimulator = () => {
         const step = conversationSteps[pendingMessages.stepId];
         if (step?.isEnd) {
           setIsEnded(true);
-        } else if (step?.patientChoices) {
-          setChoices(step.patientChoices);
         }
       }
     }, delay);
@@ -92,7 +89,6 @@ const ConversationSimulator = () => {
       stepId: currentStepId,
     };
     setMessages((prev) => [...prev, patientMsg]);
-    setChoices([]);
 
     const currentStep = conversationSteps[currentStepId];
     let nextStepId = currentStep?.nextStep;
@@ -115,7 +111,6 @@ const ConversationSimulator = () => {
     setMessages([]);
     setCurrentStepId("start");
     setIsTyping(false);
-    setChoices([]);
     setIsEnded(false);
     setPendingMessages(null);
     msgCounter.current = 0;
@@ -129,18 +124,29 @@ const ConversationSimulator = () => {
   };
 
   return (
-    <div className="relative">
+    <>
+      <button
+        type="button"
+        onClick={handleReset}
+        className="fixed top-3 right-3 z-50 flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-medium
+                   bg-background/90 text-muted-foreground shadow-sm border border-border/60 backdrop-blur-sm
+                   hover:bg-muted hover:text-foreground transition-colors"
+        aria-label="Restart conversation"
+      >
+        <RotateCcw className="h-3.5 w-3.5" />
+        Restart
+      </button>
+
       <PhoneFrame>
         <SMSHeader />
 
-        {/* Messages area */}
+        {/* Messages area — scrolls inside the thread only, not the page */}
         <div
           ref={scrollRef}
-          className="flex-1 min-h-0 overflow-y-auto py-3 space-y-[2px]"
+          className="flex-1 min-h-0 overflow-y-auto py-2 space-y-[2px]"
           style={{ scrollBehavior: "smooth", WebkitOverflowScrolling: "touch" } as React.CSSProperties}
         >
-          {/* iMessage-style date header */}
-          <div className="text-center text-[11px] text-sms-timestamp font-medium mb-3">
+          <div className="text-center text-[10px] text-sms-timestamp font-medium mb-2">
             Today 2:34 PM
           </div>
 
@@ -156,38 +162,9 @@ const ConversationSimulator = () => {
           {isTyping && <SMSTypingIndicator />}
         </div>
 
-        {/* Quick-reply chips (above keyboard) */}
-        {choices.length > 0 && !isEnded && (
-          <div className="px-3 py-2 flex flex-wrap gap-2 border-t border-border/30 bg-phone-screen">
-            {choices.map((choice) => (
-              <button
-                key={choice}
-                onClick={() => handleSend(choice)}
-                disabled={isTyping}
-                className="px-3 py-1.5 rounded-full border border-primary text-primary text-[13px]
-                           bg-transparent hover:bg-primary/10 active:bg-primary/20
-                           disabled:opacity-40 transition-colors"
-              >
-                {choice}
-              </button>
-            ))}
-          </div>
-        )}
-
         <SMSInputBar onSend={handleSend} disabled={isEnded || isTyping} />
       </PhoneFrame>
-
-      {/* Restart button below the phone */}
-      <button
-        onClick={handleReset}
-        className="absolute -bottom-16 left-1/2 -translate-x-1/2 flex items-center gap-2 px-4 py-2 rounded-full
-                   bg-foreground/5 hover:bg-foreground/10 text-foreground/60 hover:text-foreground/80
-                   text-sm font-medium transition-colors"
-      >
-        <RotateCcw className="w-4 h-4" />
-        Restart conversation
-      </button>
-    </div>
+    </>
   );
 };
 
