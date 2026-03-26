@@ -97,6 +97,34 @@ class BookAppointmentOutput(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# list_patient_appointments
+# ---------------------------------------------------------------------------
+
+
+class ListPatientAppointmentsInput(BaseModel):
+    """Return upcoming (non-cancelled) appointments for a verified patient."""
+
+    patient_id: str
+
+
+class AppointmentSummary(BaseModel):
+    """Compact appointment row for presenting a pick-list to the patient."""
+
+    id: str
+    appointment_type_display: str
+    date_label: str
+    time_label: str
+    provider_display_name: str | None = None
+    status: str
+
+
+class ListPatientAppointmentsOutput(BaseModel):
+    patient_id: str
+    appointments: list[AppointmentSummary]
+    total: int
+
+
+# ---------------------------------------------------------------------------
 # reschedule_appointment
 # ---------------------------------------------------------------------------
 

@@ -69,6 +69,10 @@ async def post_chat(
     is_first_turn = body.state is None
     current_state = body.state or WorkflowState()
 
+    # --- appointment selection turn (reschedule/cancel: patient picks which appointment) ---
+    if current_state.step == "selecting_appointment" and current_state.appointment_options:
+        return _handle_appointment_selection(body.message, current_state, db)
+
     # --- slot selection turn (user chose from presented options) ---
     if current_state.step == "selecting_slot" and current_state.slot_options:
         return _handle_slot_selection(body.message, current_state, db, practice_id)
@@ -296,11 +300,46 @@ def _dispatch_tool(
                 return reply, new_state, tools
 
             # ------------------------------------------------------------------
-            # Stubs for flows not yet implemented
+            # Cancel appointment — direct tool call (no slot search needed)
             # ------------------------------------------------------------------
-            case "reschedule_appointment" | "cancel_appointment" | "book_family_appointments":
+            case "cancel_appointment":
+                from schemas.tools import CancelAppointmentInput
+                from tools.scheduling_tools import cancel_appointment
+
+                if not state.appointment_id:
+                    return (
+                        "I lost track of which appointment to cancel — could you let me know the date?",
+                        state,
+                        [],
+                    )
+                result = cancel_appointment(
+                    db,
+                    CancelAppointmentInput(
+                        appointment_id=state.appointment_id,
+                        cancel_reason=tool_input_data.get("cancel_reason") or "Patient request",
+                    ),
+                )
+                if not result.success or not result.cancelled_appointment:
+                    return (
+                        f"I wasn't able to cancel that appointment: {result.error or 'unknown error'}. "
+                        "Please call us at (416) 555-0100 and we can sort it out.",
+                        state,
+                        ["cancel_appointment"],
+                    )
+                a = result.cancelled_appointment
+                reply = (
+                    f"Done — your {a.appointment_type_display} on {a.date_label} at {a.time_label} "
+                    "has been cancelled. If you ever want to rebook, just text us anytime. - Maya"
+                )
+                new_state = state.model_copy(update={"step": "confirmed"})
+                return reply, new_state, ["cancel_appointment"]
+
+            # ------------------------------------------------------------------
+            # Family booking stub
+            # ------------------------------------------------------------------
+            case "book_family_appointments":
                 return (
-                    "That feature is coming soon. Please call us at (416) 555-0100 and we will be happy to help.",
+                    "Family booking is coming soon. Please call us at (416) 555-0100 and we will be happy to help.",
                     state,
                     [],
                 )
@@ -363,12 +402,8 @@ def _resume_pending_workflow(
         return reply, new_state, ["lookup_patient"] + tools
 
     if pending in ("reschedule_appointment", "cancel_appointment"):
-        return (
-            f"Welcome back {first_name}! That feature is coming soon — "
-            "please call us at (416) 555-0100 and we'll be happy to help.",
-            state,
-            ["lookup_patient"],
-        )
+        reply, new_state = _list_and_present_appointments(state, db, first_name)
+        return reply, new_state, ["lookup_patient", "list_patient_appointments"]
 
     # Verified but no specific pending workflow (standalone verification)
     return (
@@ -376,6 +411,113 @@ def _resume_pending_workflow(
         state,
         ["lookup_patient"],
     )
+
+
+# ---------------------------------------------------------------------------
+# Appointment listing helper — fetch upcoming appts and present as a pick-list
+# ---------------------------------------------------------------------------
+
+
+def _list_and_present_appointments(
+    state: WorkflowState,
+    db: Session,
+    first_name: str,
+) -> tuple[str, WorkflowState]:
+    """
+    List a verified patient's upcoming appointments and ask them to pick one.
+    Returns (reply, updated_state) where state.step = 'selecting_appointment'.
+    """
+    from schemas.tools import ListPatientAppointmentsInput
+    from tools.scheduling_tools import list_patient_appointments
+
+    result = list_patient_appointments(
+        db, ListPatientAppointmentsInput(patient_id=state.patient_id)
+    )
+
+    if not result.appointments:
+        pending = state.collected_fields.get("_pending_workflow", "")
+        action = "reschedule" if pending == "reschedule_appointment" else "cancel"
+        reply = (
+            f"I looked up your file, {first_name}, but I don't see any upcoming appointments. "
+            f"Nothing to {action} right now! Is there anything else I can help you with?"
+        )
+        new_state = state.model_copy(update={"step": "done"})
+        return reply, new_state
+
+    pending = state.collected_fields.get("_pending_workflow", "")
+    verb = "reschedule" if pending == "reschedule_appointment" else "cancel"
+    lines = "\n".join(
+        f"{i + 1}. {a.appointment_type_display} — {a.date_label}, {a.time_label}"
+        for i, a in enumerate(result.appointments)
+    )
+    appt_options = [
+        {"id": a.id, "label": f"{a.appointment_type_display} — {a.date_label}, {a.time_label}"}
+        for a in result.appointments
+    ]
+    reply = (
+        f"Hey {first_name}! Here are your upcoming appointments:\n\n"
+        f"{lines}\n\n"
+        f"Which one would you like to {verb}? Reply with the number."
+    )
+    new_state = state.model_copy(
+        update={"step": "selecting_appointment", "appointment_options": appt_options}
+    )
+    return reply, new_state
+
+
+# ---------------------------------------------------------------------------
+# Appointment selection handler — called when step == 'selecting_appointment'
+# ---------------------------------------------------------------------------
+
+
+def _handle_appointment_selection(
+    message: str,
+    state: WorkflowState,
+    db: Session,
+) -> ChatResponse:
+    """
+    Parse the patient's appointment choice, store appointment_id, then
+    prompt for the next piece of info (new date for reschedule; reason for cancel).
+    """
+    from state_machine.extractors import extract_slot_choice  # same ordinal logic
+
+    choice = extract_slot_choice(message)
+
+    if choice is None or choice < 1 or choice > len(state.appointment_options):
+        available = len(state.appointment_options)
+        return ChatResponse(
+            reply=f"Please reply with a number between 1 and {available} to choose an appointment.",
+            state=state,
+        )
+
+    chosen = state.appointment_options[choice - 1]
+    appointment_id = chosen["id"]
+    label = chosen["label"]
+
+    pending = state.collected_fields.get("_pending_workflow", "")
+
+    # Store appointment_id and reset to collecting so the machine can gather the
+    # remaining required fields (preferred_date_from for reschedule, cancel_reason for cancel).
+    new_state = state.model_copy(
+        update={
+            "appointment_id": appointment_id,
+            "step": "collecting",
+            "appointment_options": [],
+            # Clear any stale date fields so the machine prompts fresh
+            "collected_fields": {
+                k: v
+                for k, v in state.collected_fields.items()
+                if k not in ("preferred_date_from", "preferred_time_of_day", "cancel_reason")
+            },
+        }
+    )
+
+    if pending == "reschedule_appointment":
+        reply = f"Got it — I'll move your {label}. What dates work better for you?"
+    else:
+        reply = f"Got it — I'll cancel your {label}. Mind sharing the reason? (totally fine if it's just scheduling)"
+
+    return ChatResponse(reply=reply, state=new_state)
 
 
 # ---------------------------------------------------------------------------
@@ -505,17 +647,39 @@ def _handle_slot_selection(
     except ValueError:
         appt_code = "cleaning"
 
-    result = book_appointment(
-        db,
-        BookAppointmentInput(
-            patient_id=state.patient_id,
-            slot_id=slot_id,
-            appointment_type_code=appt_code,
-            booked_via="chatbot",
-        ),
-    )
+    is_reschedule = state.workflow == "reschedule_appointment"
 
-    if not result.success or not result.appointment:
+    if is_reschedule:
+        from schemas.tools import RescheduleAppointmentInput
+        from tools.scheduling_tools import reschedule_appointment
+
+        result = reschedule_appointment(
+            db,
+            RescheduleAppointmentInput(
+                appointment_id=state.appointment_id,
+                new_slot_id=slot_id,
+            ),
+        )
+        success = result.success
+        appointment = result.new_appointment
+        error = result.error
+        tool_used = "reschedule_appointment"
+    else:
+        result = book_appointment(
+            db,
+            BookAppointmentInput(
+                patient_id=state.patient_id,
+                slot_id=slot_id,
+                appointment_type_code=appt_code,
+                booked_via="chatbot",
+            ),
+        )
+        success = result.success
+        appointment = result.appointment
+        error = result.error
+        tool_used = "book_appointment"
+
+    if not success or not appointment:
         # Slot was taken — re-present remaining options
         remaining = [o for i, o in enumerate(state.slot_options) if i + 1 != choice]
         if remaining:
@@ -536,15 +700,24 @@ def _handle_slot_selection(
             state=state.model_copy(update={"step": "collecting", "slot_options": []}),
         )
 
-    a = result.appointment
+    a = appointment
     provider = f" with {a.provider_display_name}" if a.provider_display_name else ""
-    confirm_reply = (
-        f"You're all set! Your {a.appointment_type_display} is confirmed:\n\n"
-        f"Date: {a.date_label}\n"
-        f"Time: {a.time_label}{provider}\n"
-        f"Location: {a.location_name}\n\n"
-        "We'll see you then! Reply anytime if you need to make changes. - Maya"
-    )
+    if is_reschedule:
+        confirm_reply = (
+            f"Done! Your {a.appointment_type_display} has been rescheduled:\n\n"
+            f"New Date: {a.date_label}\n"
+            f"New Time: {a.time_label}{provider}\n"
+            f"Location: {a.location_name}\n\n"
+            "We'll see you then! Reply anytime if you need anything else. - Maya"
+        )
+    else:
+        confirm_reply = (
+            f"You're all set! Your {a.appointment_type_display} is confirmed:\n\n"
+            f"Date: {a.date_label}\n"
+            f"Time: {a.time_label}{provider}\n"
+            f"Location: {a.location_name}\n\n"
+            "We'll see you then! Reply anytime if you need to make changes. - Maya"
+        )
 
     new_state = state.model_copy(
         update={
@@ -558,7 +731,7 @@ def _handle_slot_selection(
         reply=confirm_reply,
         state=new_state,
         actions=[],
-        tools_called=["book_appointment"],
+        tools_called=[tool_used],
     )
 
 

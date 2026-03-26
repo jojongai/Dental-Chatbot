@@ -124,6 +124,11 @@ class WorkflowState(BaseModel):
     # Set after user picks a slot (before book_appointment is called)
     selected_slot_id: str | None = None
 
+    # Appointment selection state — populated when listing a patient's upcoming appointments
+    # so they can choose which one to reschedule or cancel.
+    # List of {"id": appointment_id, "label": "Cleaning — Mon Apr 14, 10:00 AM"}
+    appointment_options: list[dict] = Field(default_factory=list)
+
 
 # ---------------------------------------------------------------------------
 # Chat request / response

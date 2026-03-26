@@ -15,12 +15,15 @@ from models.scheduling import Appointment, AppointmentRequest, AppointmentSlot, 
 from models.staff import Provider
 from schemas.appointment import AppointmentOut, SlotOut, SlotSearchOut
 from schemas.tools import (
+    AppointmentSummary,
     BookAppointmentInput,
     BookAppointmentOutput,
     BookFamilyAppointmentsInput,
     BookFamilyAppointmentsOutput,
     CancelAppointmentInput,
     CancelAppointmentOutput,
+    ListPatientAppointmentsInput,
+    ListPatientAppointmentsOutput,
     RescheduleAppointmentInput,
     RescheduleAppointmentOutput,
     SearchSlotsInput,
@@ -234,13 +237,121 @@ def book_appointment(db: Session, payload: BookAppointmentInput) -> BookAppointm
 
 
 # ---------------------------------------------------------------------------
+# list_patient_appointments
+# ---------------------------------------------------------------------------
+
+
+def list_patient_appointments(
+    db: Session, payload: ListPatientAppointmentsInput
+) -> ListPatientAppointmentsOutput:
+    """Return upcoming (non-cancelled) appointments for a patient, ordered by starts_at ASC."""
+    now = datetime.now(tz=TZ)
+
+    rows = (
+        db.execute(
+            select(Appointment)
+            .where(
+                Appointment.patient_id == payload.patient_id,
+                Appointment.status.notin_(["cancelled", "no_show"]),
+                Appointment.scheduled_starts_at >= now,
+            )
+            .order_by(Appointment.scheduled_starts_at.asc())
+            .limit(10)
+        )
+        .scalars()
+        .all()
+    )
+
+    summaries: list[AppointmentSummary] = []
+    for appt in rows:
+        appt_type = db.get(AppointmentType, appt.appointment_type_id)
+        provider = db.get(Provider, appt.provider_id) if appt.provider_id else None
+        starts = appt.scheduled_starts_at.astimezone(TZ)
+        ends = appt.scheduled_ends_at.astimezone(TZ)
+        summaries.append(
+            AppointmentSummary(
+                id=appt.id,
+                appointment_type_display=appt_type.display_name if appt_type else "Appointment",
+                date_label=fmt_date(starts),
+                time_label=fmt_time_range(starts, ends),
+                provider_display_name=provider.display_name if provider else None,
+                status=appt.status,
+            )
+        )
+
+    return ListPatientAppointmentsOutput(
+        patient_id=payload.patient_id,
+        appointments=summaries,
+        total=len(summaries),
+    )
+
+
+# ---------------------------------------------------------------------------
 # reschedule_appointment
 # ---------------------------------------------------------------------------
 
 
 def reschedule_appointment(db: Session, payload: RescheduleAppointmentInput) -> RescheduleAppointmentOutput:
-    """Reschedule: free old slot, book new slot, link back via rescheduled_from."""
-    raise NotImplementedError("reschedule_appointment not yet implemented")
+    """Free old slot, book new slot, link new appointment back to old via rescheduled_from."""
+    # --- fetch original appointment ---
+    old_appt = db.get(Appointment, payload.appointment_id)
+    if not old_appt:
+        return RescheduleAppointmentOutput(success=False, error="Appointment not found.")
+    if old_appt.status in ("cancelled", "completed", "no_show"):
+        return RescheduleAppointmentOutput(
+            success=False, error=f"Cannot reschedule an appointment with status '{old_appt.status}'."
+        )
+
+    # --- fetch and validate new slot ---
+    new_slot = db.get(AppointmentSlot, payload.new_slot_id)
+    if not new_slot:
+        return RescheduleAppointmentOutput(success=False, error="New slot not found.")
+    if new_slot.slot_status != "available":
+        return RescheduleAppointmentOutput(
+            success=False,
+            error="Sorry, that slot was just taken. Let me find you another available time.",
+        )
+
+    # --- free old slot ---
+    old_slot = db.get(AppointmentSlot, old_appt.slot_id)
+    if old_slot:
+        old_slot.slot_status = "available"
+
+    # --- cancel old appointment record ---
+    old_appt.status = "rescheduled"
+
+    # --- book new appointment ---
+    new_slot.slot_status = "booked"
+    new_appt = Appointment(
+        patient_id=old_appt.patient_id,
+        slot_id=new_slot.id,
+        location_id=new_slot.location_id,
+        provider_id=new_slot.provider_id,
+        operatory_id=new_slot.operatory_id,
+        appointment_type_id=old_appt.appointment_type_id,
+        status="booked",
+        booked_via="chatbot",
+        scheduled_starts_at=new_slot.starts_at,
+        scheduled_ends_at=new_slot.ends_at,
+        reason_for_visit=old_appt.reason_for_visit,
+        special_instructions=old_appt.special_instructions,
+        is_emergency=old_appt.is_emergency,
+        rescheduled_from_appointment_id=old_appt.id,
+    )
+    if payload.reason:
+        new_appt.special_instructions = (
+            f"Reschedule reason: {payload.reason}. {new_appt.special_instructions or ''}"
+        ).strip()
+
+    db.add(new_appt)
+    db.commit()
+    db.refresh(new_appt)
+
+    return RescheduleAppointmentOutput(
+        success=True,
+        old_appointment=_appt_to_out(old_appt, db),
+        new_appointment=_appt_to_out(new_appt, db),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +361,29 @@ def reschedule_appointment(db: Session, payload: RescheduleAppointmentInput) -> 
 
 def cancel_appointment(db: Session, payload: CancelAppointmentInput) -> CancelAppointmentOutput:
     """Cancel an appointment and free its slot."""
-    raise NotImplementedError("cancel_appointment not yet implemented")
+    appt = db.get(Appointment, payload.appointment_id)
+    if not appt:
+        return CancelAppointmentOutput(success=False, error="Appointment not found.")
+    if appt.status in ("cancelled", "completed", "no_show"):
+        return CancelAppointmentOutput(
+            success=False, error=f"This appointment is already marked '{appt.status}'."
+        )
+
+    # Free the slot so others can book it
+    slot = db.get(AppointmentSlot, appt.slot_id)
+    if slot:
+        slot.slot_status = "available"
+
+    appt.status = "cancelled"
+    if payload.cancel_reason:
+        appt.special_instructions = (
+            f"Cancelled: {payload.cancel_reason}. {appt.special_instructions or ''}"
+        ).strip()
+
+    db.commit()
+    db.refresh(appt)
+
+    return CancelAppointmentOutput(success=True, cancelled_appointment=_appt_to_out(appt, db))
 
 
 # ---------------------------------------------------------------------------

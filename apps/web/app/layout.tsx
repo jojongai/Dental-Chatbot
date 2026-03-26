@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Dental Chatbot",
-  description: "Dental office assistant chat (skeleton)",
+  title: "Maya — Bright Smile Dental",
+  description: "Missed-call SMS assistant for Bright Smile Dental",
 };
 
 export default function RootLayout({

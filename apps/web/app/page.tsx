@@ -1,32 +1,20 @@
-import { HealthResponseSchema } from "@dental-chatbot/shared-types";
-
-import { Button } from "@/components/ui/button";
+import ConversationSimulator from "@/components/ConversationSimulator";
 
 export default function Home() {
-  const sample = HealthResponseSchema.parse({
-    status: "ok",
-    service: "web",
-    database: "sqlite",
-  });
-
   return (
-    <main className="mx-auto flex min-h-screen max-w-3xl flex-col gap-6 px-6 py-16">
-      <h1 className="text-3xl font-semibold tracking-tight">Dental Chatbot</h1>
-      <p className="text-slate-600">
-        Next.js frontend is running. Shared type check:{" "}
-        <code className="rounded bg-slate-200 px-1.5 py-0.5 text-sm">{sample.service}</code>
-      </p>
-      <p className="text-sm text-slate-500">
-        API URL (from env):{" "}
-        <code className="rounded bg-slate-200 px-1.5 py-0.5">
-          {process.env.NEXT_PUBLIC_API_URL ?? "(set NEXT_PUBLIC_API_URL)"}
-        </code>
-      </p>
-      <div>
-        <Button type="button" variant="outline" size="sm">
-          shadcn/ui button
-        </Button>
+    <main className="min-h-screen bg-background flex flex-col items-center justify-center py-12 px-4">
+      <div className="text-center mb-8 max-w-lg">
+        <h1 className="text-2xl font-bold text-foreground tracking-tight mb-2">
+          Bright Smile Dental — Maya
+        </h1>
+        <p className="text-sm text-muted-foreground">
+          Missed-call SMS assistant · tap the reply chips or type freely
+        </p>
       </div>
+
+      <ConversationSimulator />
+
+      <div className="h-20" />
     </main>
   );
 }

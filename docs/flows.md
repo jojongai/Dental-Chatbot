@@ -345,6 +345,138 @@ User: "I want to book a cleaning next week"
 
 ---
 
+### 8. Reschedule Appointment ✅ Live
+
+**Trigger phrases:** "I need to move my appointment", "Can I reschedule?", "Change my cleaning", "I can't make it Thursday"
+
+**Requires:** patient identity (sub-workflow 6)
+
+**Fields collected:**
+
+| Field | Example |
+|-------|---------|
+| Preferred date from | "next week", "April 14" |
+
+**Optional fields:** preferred time of day
+
+**Flow:**
+
+```
+MAYA: "No problem, I can move that for you! To find your file,
+       what's your full name and phone number?"
+
+PATIENT: "Alice Thompson, 416-555-0201"
+
+MAYA: "Give me one sec to look you up!"
+
+[lookup_patient — verified]
+
+MAYA: "Hey Alice! Here are your upcoming appointments:
+       1. Teeth Cleaning — Sunday, March 29, 9:00 AM – 10:00 AM
+       2. Teeth Cleaning — Sunday, April 5, 11:00 AM – 12:00 PM
+
+       Which one would you like to reschedule? Reply with the number."
+
+PATIENT: "1"
+
+MAYA: "Got it — I'll move your Teeth Cleaning — Sunday, March 29.
+       What dates work better for you?"
+
+PATIENT: "Next Thursday"
+
+MAYA: "Here are the next available slots for your Teeth Cleaning:
+       1. Thursday, April 3, 10:00 AM – 11:00 AM
+       2. Friday, April 4, 11:00 AM – 12:00 PM
+       3. Saturday, April 5, 10:00 AM – 11:00 AM
+       Which one works best for you? Reply with 1, 2, or 3."
+
+PATIENT: "2"
+
+MAYA: "Done! Your Teeth Cleaning has been rescheduled:
+       New Date: Friday, April 4
+       New Time: 11:00 AM – 12:00 PM with Dr. Smith
+       Location: Downtown Toronto
+       We'll see you then! - Maya"
+```
+
+**State machine steps:**
+
+| Step | What happens |
+|------|-------------|
+| `collecting` (verification sub-workflow) | Machine gathers `first_name`, `last_name`, `phone_number` |
+| `lookup_patient` dispatched | `_resume_pending_workflow` → `_list_and_present_appointments` |
+| `selecting_appointment` | Patient picks which appointment to move |
+| `collecting` (reschedule fields) | Machine asks for `preferred_date_from` |
+| `search_slots` dispatched | `_search_and_present_slots` shows 1–3 options |
+| `selecting_slot` | `_handle_slot_selection` detects `workflow="reschedule_appointment"` → calls `reschedule_appointment` tool |
+| `confirmed` | New appointment confirmed, old slot freed |
+
+**Tools:** `lookup_patient` → `list_patient_appointments` → `search_slots` → `reschedule_appointment`
+**Slot freed:** old slot set back to `available`; old appointment marked `rescheduled`; `rescheduled_from_appointment_id` links the two records.
+
+---
+
+### 9. Cancel Appointment ✅ Live
+
+**Trigger phrases:** "Cancel my appointment", "I need to cancel", "Cancel my cleaning on Friday"
+
+**Requires:** patient identity (sub-workflow 6)
+
+**Fields collected:**
+
+| Field | Example |
+|-------|---------|
+| Cancel reason | "Scheduling conflict", "I'm moving" |
+
+**Flow:**
+
+```
+MAYA: "Got it, I can take care of that for you.
+       To find your file, what's your full name and phone number?"
+
+PATIENT: "Alice Thompson, 416-555-0201"
+
+[lookup_patient — verified]
+
+MAYA: "Hey Alice! Here are your upcoming appointments:
+       1. Teeth Cleaning — Sunday, March 29, 9:00 AM – 10:00 AM
+       2. Teeth Cleaning — Sunday, April 5, 11:00 AM – 12:00 PM
+       Which one would you like to cancel? Reply with the number."
+
+PATIENT: "1"
+
+MAYA: "Got it — I'll cancel your Teeth Cleaning — Sunday, March 29.
+       Mind sharing the reason? (totally fine if it's just scheduling)"
+
+PATIENT: "I'm moving to another city"
+
+MAYA: "Just want to make sure I have the right appointment before I cancel it.
+       [confirmation prompt]"
+
+PATIENT: "yes"
+
+MAYA: "Done — your Teeth Cleaning on Sunday, March 29 at 9:00 AM – 10:00 AM
+       has been cancelled. If you ever want to rebook, just text us anytime. - Maya"
+```
+
+**State machine steps:**
+
+| Step | What happens |
+|------|-------------|
+| `collecting` (verification sub-workflow) | Machine gathers `first_name`, `last_name`, `phone_number` |
+| `lookup_patient` dispatched | `_resume_pending_workflow` → `_list_and_present_appointments` |
+| `selecting_appointment` | Patient picks which appointment to cancel |
+| `collecting` (cancel fields) | Machine asks for `cancel_reason` |
+| `confirmation` | Machine shows summary; waits for "yes" |
+| `cancel_appointment` dispatched | Slot freed, appointment status → `cancelled` |
+| `confirmed` | Cancellation confirmed |
+
+**Tools:** `lookup_patient` → `list_patient_appointments` → `cancel_appointment`
+**Slot freed:** slot set back to `available` so other patients can book it.
+**Requires confirmation before tool call: yes**
+
+---
+
 ### 11. Family Booking 🔧 Stub
 
 **Trigger phrases:** "Book for my whole family", "I need appointments for my kids", "Can we all come in the same day?"
@@ -432,8 +564,9 @@ first match:
 | `create_patient` | 5 | ✅ Live |
 | `search_slots` | 5 · 7 · 8 · 10 | ✅ Live |
 | `book_appointment` | 5 · 7 · 10 | ✅ Live |
-| `reschedule_appointment` | 8 | 🔧 Stub |
-| `cancel_appointment` | 9 | 🔧 Stub |
+| `list_patient_appointments` | 8 · 9 | ✅ Live |
+| `reschedule_appointment` | 8 | ✅ Live |
+| `cancel_appointment` | 9 | ✅ Live |
 | `book_family_appointments` | 11 | 🔧 Stub |
 | `create_staff_notification` | 10 · 12 | 🔧 Stub |
 
@@ -445,9 +578,11 @@ Both flows 5 and 7 share the same slot-selection pipeline — no duplicated logi
 
 | Helper | Location | Used by |
 |--------|----------|---------|
-| `_search_and_present_slots` | `routers/chat.py` | Flows 5 and 7 (and 8/10 when implemented) |
-| `_handle_slot_selection` | `routers/chat.py` | Flows 5 and 7 — parses "1" / "first" / "option 2" → `book_appointment` |
-| `_resume_pending_workflow` | `routers/chat.py` | Flow 6 — resumes whichever workflow triggered verification |
+| `_search_and_present_slots` | `routers/chat.py` | Flows 5, 7, and 8 — queries DB, formats 1–3 numbered slot options |
+| `_handle_slot_selection` | `routers/chat.py` | Flows 5, 7, and 8 — parses "1" / "first" / "option 2" → calls `book_appointment` (new/existing booking) or `reschedule_appointment` (flow 8) |
+| `_list_and_present_appointments` | `routers/chat.py` | Flows 8 and 9 — fetches upcoming appointments, formats numbered pick-list |
+| `_handle_appointment_selection` | `routers/chat.py` | Flows 8 and 9 — stores chosen `appointment_id`, resets step to `collecting` for next field |
+| `_resume_pending_workflow` | `routers/chat.py` | Flow 6 — resumes whichever workflow triggered verification; calls `_list_and_present_appointments` for flows 8/9 |
 | `_apply_verification_retry` | `routers/chat.py` | Flow 6 — handles disambiguation and re-confirm retry turns |
 | `normalize_appointment_type` | `tools/validators.py` | Flows 5 and 7 — maps free text to canonical codes |
 | `normalize_phone` | `tools/validators.py` | Flow 5 — validates and normalises phone before `create_patient` |
