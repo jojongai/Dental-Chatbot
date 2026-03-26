@@ -1,15 +1,13 @@
 from collections.abc import Generator
 from pathlib import Path
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import Engine
-from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
+# Import all models so they register with Base.metadata before create_all().
 from config import get_settings
-
-
-class Base(DeclarativeBase):
-    pass
+from models.base import Base
 
 
 def _ensure_sqlite_parent_dir(url: str) -> None:
@@ -38,7 +36,17 @@ engine = create_engine_from_settings()
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 
+@event.listens_for(engine, "connect")
+def _set_sqlite_pragma(dbapi_connection, _connection_record) -> None:
+    """Enable FK enforcement for SQLite connections."""
+    if "sqlite" in str(engine.url):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+
 def init_db() -> None:
+    """Create all tables (SQLite / dev). For Postgres use `alembic upgrade head`."""
     Base.metadata.create_all(bind=engine)
 
 

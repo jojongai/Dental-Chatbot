@@ -5,6 +5,8 @@
     "dev": "bash scripts/dev.sh",
     "build": "echo 'Python API has no separate build step.'",
     "lint": "bash scripts/lint.sh",
-    "test": "bash scripts/test.sh"
+    "test": "bash scripts/test.sh",
+    "seed": "bash scripts/seed.sh",
+    "db:migrate": "bash scripts/migrate.sh"
   }
 }
