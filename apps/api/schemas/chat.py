@@ -125,22 +125,31 @@ class WorkflowState(BaseModel):
 
 class ChatRequest(BaseModel):
     """
-    Sent by the frontend on every user message.
+    Sent by the frontend / SMS gateway on every user message.
 
     Fields
     ------
     session_id
-        Stable browser-session token. Used to resume or create a Conversation row.
+        Stable session token (browser or SMS thread ID).
     message
         The user's raw text.
     state
         The WorkflowState from the previous response, echoed back so the server
         can resume mid-workflow without a DB read on every turn.
+    caller_phone
+        The patient's phone number as captured from caller ID by the SMS gateway.
+        When present on the first turn the server pre-populates the phone field so
+        the chatbot never has to ask for it again.
     """
 
     session_id: str = Field(..., examples=["abc123"])
     message: str = Field(..., examples=["I want to book a cleaning next week"])
     state: WorkflowState | None = None
+    caller_phone: str | None = Field(
+        None,
+        description="Phone number from caller ID. Injected by the SMS gateway on the first turn.",
+        examples=["+14165550100"],
+    )
 
 
 class ChatResponse(BaseModel):

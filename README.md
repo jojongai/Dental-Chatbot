@@ -13,6 +13,7 @@ Monorepo for a dental-office assistant chatbot: **Next.js** frontend (`apps/web`
 | **Python tooling** | **[uv](https://docs.astral.sh/uv/)**           | Lockfile + fast installs (`uv.lock` in `apps/api`). Poetry is a fine alternative; this repo standardizes on uv.                            |
 
 See `docs/architecture.md` for boundaries and data flow.
+See `docs/flows.md` for a full list of supported chat flows and their implementation status.
 
 ## Prerequisites
 

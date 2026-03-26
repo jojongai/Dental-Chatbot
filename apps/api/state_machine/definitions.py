@@ -192,8 +192,8 @@ WORKFLOWS: dict[Workflow, WorkflowDef] = {
         optional_fields=[],
         tool_name="get_clinic_info",
         greeting=(
-            "Happy to help! I can answer questions about our hours, location, "
-            "insurance plans, payment options, and more. What would you like to know?"
+            "Hey, this is Maya from Bright Smile Dental - sorry we missed your call! "
+            "I can help with hours, location, insurance, or booking. What do you need?"
         ),
     ),
     # ------------------------------------------------------------------
@@ -216,8 +216,8 @@ WORKFLOWS: dict[Workflow, WorkflowDef] = {
         tool_name="create_patient",
         requires_confirmation=True,
         greeting=(
-            "Welcome! I'd be happy to get you registered as a new patient. "
-            "This will just take a minute — let's start with your full name."
+            "Hey, this is Maya from Bright Smile Dental - sorry we missed your call! "
+            "I can get you registered as a new patient right here. What is your full name?"
         ),
         ready_message=(
             "Great, I have everything I need to register you. Let me just confirm the details before we proceed."
@@ -235,8 +235,8 @@ WORKFLOWS: dict[Workflow, WorkflowDef] = {
         optional_fields=["phone_number", "first_name"],
         tool_name="lookup_patient",
         greeting=(
-            "To pull up your records, I'll need to verify your identity. "
-            "Could you tell me your last name and date of birth?"
+            "Hey, this is Maya from Bright Smile Dental - sorry we missed your call! "
+            "To pull up your file, could you tell me your last name and date of birth?"
         ),
         ready_message="Thanks — let me look you up in our system.",
     ),
@@ -254,9 +254,9 @@ WORKFLOWS: dict[Workflow, WorkflowDef] = {
         tool_name="search_slots",
         requires_patient_id=True,
         greeting=(
-            "I can help you schedule an appointment. "
-            "What type of appointment would you like — cleaning, general check-up, "
-            "new patient exam, or emergency?"
+            "Hey, this is Maya from Bright Smile Dental - sorry we missed your call! "
+            "I can book an appointment for you right now. "
+            "What type do you need - cleaning, check-up, new patient exam, or emergency?"
         ),
         ready_message="Let me search for available slots for you.",
     ),
@@ -276,7 +276,8 @@ WORKFLOWS: dict[Workflow, WorkflowDef] = {
         tool_name="search_slots",
         requires_patient_id=True,
         greeting=(
-            "I can help you reschedule. First, let me verify your identity and pull up your upcoming appointments."
+            "Hey, this is Maya from Bright Smile Dental - sorry we missed your call! "
+            "I can reschedule your appointment. Let me first pull up your file."
         ),
         ready_message="Let me find available slots for rescheduling.",
     ),
@@ -294,7 +295,10 @@ WORKFLOWS: dict[Workflow, WorkflowDef] = {
         tool_name="cancel_appointment",
         requires_patient_id=True,
         requires_confirmation=True,
-        greeting=("I can help you cancel your appointment. Let me first verify your identity."),
+        greeting=(
+            "Hey, this is Maya from Bright Smile Dental - sorry we missed your call! "
+            "I can cancel your appointment. Let me first pull up your file."
+        ),
         ready_message="Understood. Let me confirm the cancellation details.",
     ),
     # ------------------------------------------------------------------
@@ -312,8 +316,8 @@ WORKFLOWS: dict[Workflow, WorkflowDef] = {
         requires_patient_id=True,
         requires_confirmation=True,
         greeting=(
-            "Happy to book for your whole family! "
-            "How many people need appointments, and what type of appointment does each person need?"
+            "Hey, this is Maya from Bright Smile Dental - sorry we missed your call! "
+            "I can book for your whole family. How many people need appointments?"
         ),
         ready_message=("Got it. I'll look for back-to-back slots for your family. Let me just confirm the details."),
     ),
@@ -331,10 +335,9 @@ WORKFLOWS: dict[Workflow, WorkflowDef] = {
         tool_name="create_staff_notification",
         requires_confirmation=False,  # do NOT delay — notify staff immediately
         greeting=(
-            "I'm very sorry to hear you're having a dental emergency. "
-            "I'm flagging this with our team right now.\n\n"
-            "Could you quickly share your name and a brief description of what's happening — "
-            "the location of pain, severity (1–10), and when it started?"
+            "Hey, this is Maya from Bright Smile Dental. We saw your missed call and want to help right away. "
+            "Please share your name and briefly describe what is happening - "
+            "location of pain, severity 1-10, and when it started."
         ),
         ready_message=(
             "Thank you. I've notified our dental team about your emergency "
@@ -353,8 +356,8 @@ WORKFLOWS: dict[Workflow, WorkflowDef] = {
         optional_fields=["first_name"],
         tool_name="create_staff_notification",
         greeting=(
-            "Of course — I'll connect you with a team member. "
-            "Could I take your phone number so someone can call you back?"
+            "Hey, this is Maya from Bright Smile Dental - sorry we missed your call! "
+            "I will have a team member call you back. What is your phone number?"
         ),
         ready_message=("I've let our team know. A staff member will call you back as soon as possible."),
     ),

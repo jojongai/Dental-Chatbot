@@ -6,12 +6,10 @@ Flow per turn
 1. Resume or start WorkflowState from request body.
 2. Run WorkflowStateMachine.process(message).
 3. If result.ready_to_call: attempt to call the named tool stub.
-   (Stubs raise NotImplementedError → graceful fallback until implemented.)
+   - general_inquiry  → get_clinic_info (DB) → Gemini receptionist (live)
+   - all others       → deterministic stubs (raise NotImplementedError until implemented)
 4. Append tool reply to the response message if available.
 5. Return ChatResponse with updated state, reply, and actions.
-
-The state machine handles all slot-filling logic deterministically.
-LLM orchestration (replacing tool stubs) is a Phase 1 enhancement.
 """
 
 from __future__ import annotations
@@ -37,13 +35,23 @@ async def post_chat(
     The state machine tracks exactly what information has been collected and
     what is still needed for each workflow. It signals `ready_to_call=True`
     when all required fields are present, at which point the router calls the
-    corresponding deterministic tool (currently stubs — returns 501 until
-    the tool bodies are implemented).
+    corresponding deterministic tool.
+
+    For general_inquiry the tool result is passed through the Gemini-powered
+    receptionist to produce a warm, natural-language answer.
 
     The `state` field in the response must be echoed back by the client on
     every subsequent request so the server can resume the workflow.
     """
+    is_first_turn = body.state is None
     current_state = body.state or WorkflowState()
+
+    # Pre-populate phone from caller ID so the bot never has to ask for it.
+    # The SMS gateway injects caller_phone on the first turn only.
+    if body.caller_phone and "phone_number" not in current_state.collected_fields:
+        current_state = current_state.model_copy(
+            update={"collected_fields": {**current_state.collected_fields, "phone_number": body.caller_phone}}
+        )
 
     # --- run the state machine ---
     result = _run_machine(current_state, body.message)
@@ -52,9 +60,15 @@ async def post_chat(
 
     # --- attempt tool call if machine says it's ready ---
     if result.ready_to_call and result.tool_name:
-        tool_reply = _call_tool(result.tool_name, result.tool_input_data, db)
+        tool_reply = _call_tool(
+            result.tool_name,
+            result.tool_input_data,
+            db,
+            original_message=body.message,
+            is_first_message=is_first_turn,
+        )
         if tool_reply:
-            reply = f"{reply}\n\n{tool_reply}"
+            reply = tool_reply
 
     return ChatResponse(
         reply=reply,
@@ -99,19 +113,36 @@ def _run_machine(state: WorkflowState, message: str):
 # ---------------------------------------------------------------------------
 
 
-def _call_tool(tool_name: str, data: dict, db: Session) -> str | None:
+def _call_tool(tool_name: str, data: dict, db: Session, original_message: str = "", is_first_message: bool = False) -> str | None:
     """
-    Call the named tool stub.  Returns a human-readable string appended to
-    the chatbot reply, or None if the tool is not yet implemented.
+    Call the named tool.  Returns a human-readable string to use as the
+    chatbot reply, or None if the tool is not yet implemented / failed.
+
+    For get_clinic_info the raw DB result is passed through the Gemini-powered
+    receptionist to generate a warm, natural-language answer.
     """
     try:
         match tool_name:
             case "get_clinic_info":
                 from schemas.tools import GetClinicInfoInput
-                from tools.clinic_tools import get_clinic_info
+                from tools.clinic_tools import get_clinic_info, get_pricing_options
 
-                result = get_clinic_info(db, GetClinicInfoInput(**data), practice_id="")
-                return _format_clinic_info(result)
+                # Determine the best category to query based on the user's message
+                category = _infer_clinic_category(original_message)
+                result = get_clinic_info(
+                    db,
+                    GetClinicInfoInput(category=category, question_hint=original_message),
+                    practice_id=_default_practice_id(db),
+                )
+
+                # Fetch pricing options for payment/insurance/no-insurance questions
+                pricing: list = []
+                if category in ("payment", "insurance") or _is_payment_question(original_message):
+                    pricing = get_pricing_options(db, practice_id=_default_practice_id(db))
+
+                from llm.receptionist import answer_general_inquiry
+
+                return answer_general_inquiry(original_message, result, pricing or None, is_first_message=is_first_message)
 
             case "lookup_patient":
                 from schemas.tools import LookupPatientInput
@@ -221,27 +252,43 @@ def _call_tool(tool_name: str, data: dict, db: Session) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Output formatters
+# Helpers
 # ---------------------------------------------------------------------------
 
+_CATEGORY_KEYWORDS: dict[str, list[str]] = {
+    "hours": ["hour", "open", "close", "schedule", "when", "time", "saturday", "sunday", "weekend"],
+    "location": ["where", "address", "located", "location", "parking", "direction", "find you"],
+    "insurance": ["insurance", "coverage", "plan", "benefit", "covered", "accept", "sun life", "manulife"],
+    "payment": ["payment", "pay", "no insurance", "uninsured", "self pay", "self-pay", "financing", "membership", "afford"],
+}
 
-def _format_clinic_info(result) -> str:
-    parts: list[str] = []
-    if result.settings:
-        s = result.settings
-        parts.append(f"**{s.location_name}**\n{s.address}\nHours: {s.hours_summary}")
-        insurance_line = "We accept all major dental insurance plans"
-        if s.self_pay_available:
-            insurance_line += ", and offer self-pay options"
-        if s.membership_available:
-            insurance_line += ", membership plans"
-        if s.financing_available:
-            insurance_line += ", and flexible financing"
-        parts.append(insurance_line + ".")
-    if result.faq_entries:
-        for faq in result.faq_entries[:3]:
-            parts.append(f"**Q: {faq.question}**\n{faq.answer}")
-    return "\n\n".join(parts) if parts else "I'm happy to answer any questions about our practice."
+
+def _infer_clinic_category(message: str) -> str | None:
+    """Map the user's message to the most relevant FAQ category."""
+    lower = message.lower()
+    best: str | None = None
+    best_hits = 0
+    for category, keywords in _CATEGORY_KEYWORDS.items():
+        hits = sum(1 for kw in keywords if kw in lower)
+        if hits > best_hits:
+            best_hits = hits
+            best = category
+    return best  # None → all categories returned
+
+
+def _is_payment_question(message: str) -> bool:
+    payment_words = ["payment", "pay", "no insurance", "uninsured", "self pay", "self-pay", "financing", "membership", "afford", "cost", "price", "fee"]
+    lower = message.lower()
+    return any(w in lower for w in payment_words)
+
+
+def _default_practice_id(db: Session) -> str:
+    """Return the first practice_id in the DB (single-practice deployment)."""
+    from models.practice import Practice
+    from sqlalchemy import select
+
+    row = db.execute(select(Practice.id).limit(1)).scalar_one_or_none()
+    return row or ""
 
 
 def _safe_input(data: dict, keys: list[str]) -> dict:

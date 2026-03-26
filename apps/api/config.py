@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     gemini_model: str = "gemini-2.5-flash"
     # Thinking budget in tokens (0 = disable thinking mode)
     gemini_thinking_budget: int = 0
+    # Set USE_LLM=false to skip all Gemini calls (plain-text fallback used instead).
+    # Always false in CI and unit tests; true for local dev and production.
+    use_llm: bool = True
 
 
 @lru_cache
