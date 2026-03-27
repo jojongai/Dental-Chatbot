@@ -15,6 +15,160 @@ from state_machine.definitions import WORKFLOWS, WorkflowDef
 from state_machine.machine import MachineResult
 
 
+def _is_self_relation(relation: str | None) -> bool:
+    """True when this row is the verified account holder — no new/existing question needed."""
+    if not relation:
+        return False
+    r = str(relation).strip().lower()
+    return r == "self" or r in ("me", "myself", "i")
+
+
+def _family_slot_adjustment_intent(message: str, interp: Any) -> bool:
+    """
+    User wants different dates/times than the proposed slots — not a clear yes/no on booking.
+    """
+    from state_machine.extractors import (
+        extract_group_preference,
+        extract_preferred_date,
+        extract_time_of_day,
+    )
+
+    low = message.strip().lower()
+    if extract_preferred_date(message, today=date.today()) is not None:
+        return True
+    if extract_time_of_day(message) is not None:
+        return True
+    if extract_group_preference(message) is not None:
+        return True
+    if interp and getattr(interp, "extracted_fields", None):
+        if interp.extracted_fields.get("preferred_date_from") is not None:
+            return True
+        if interp.extracted_fields.get("preferred_time_of_day") is not None:
+            return True
+    # Natural-language tweaks (not covered by extractors)
+    return bool(
+        re.search(
+            r"\b(change|different|instead|prefer|try|move|shift|reschedule|how about|"
+            r"can we|could we|what about|not those|another day|another time|too early|too late)\b",
+            low,
+        )
+    )
+
+
+def _handle_family_slot_adjustment(
+    machine: Any,
+    wf_def: WorkflowDef,
+    message: str,
+    interp: Any,
+    state: Any,
+    wf: Any,
+) -> MachineResult:
+    """
+    After a slot proposal, user declined or asked for different timing.
+    Parse new prefs when possible; do not restart from group-preference unless they mention it.
+    """
+    from tools.scheduling_tools import normalize_group_preference
+
+    from state_machine.extractors import (
+        extract_group_preference,
+        extract_preferred_date,
+        extract_time_of_day,
+    )
+
+    cf = dict(state.collected_fields)
+    cf.pop("_family_proposed_slot_ids", None)
+    gp = dict(cf.get("group_preferences") or {})
+
+    ref = date.today()
+    d = extract_preferred_date(message, today=ref)
+    if d is None and interp and getattr(interp, "extracted_fields", None):
+        pdf = interp.extracted_fields.get("preferred_date_from")
+        if isinstance(pdf, date):
+            d = pdf if pdf >= ref else None
+        elif isinstance(pdf, str):
+            d = extract_preferred_date(pdf, today=ref)
+    if d is not None and d < ref:
+        d = ref
+
+    tod = extract_time_of_day(message)
+    if tod is None and interp and getattr(interp, "extracted_fields", None):
+        itod = interp.extracted_fields.get("preferred_time_of_day")
+        if isinstance(itod, str) and itod.strip():
+            tod = extract_time_of_day(itod) or itod.strip().lower()
+    low = message.strip().lower()
+    if low in ("any", "no preference", "either", "doesn't matter", "dont care", "don't care", "flexible"):
+        tod = "any"
+
+    pref_raw = extract_group_preference(message)
+    if pref_raw is None and interp and getattr(interp, "extracted_fields", None):
+        pref_raw = interp.extracted_fields.get("group_preference")
+    if pref_raw:
+        gp["group_preference"] = normalize_group_preference(str(pref_raw))
+
+    if d is not None:
+        gp["preferred_date_from"] = d
+    if tod is not None:
+        gp["preferred_time_of_day"] = tod
+    cf["group_preferences"] = gp
+
+    # Enough to search again — same path as finishing time-of-day step
+    if d is not None and tod is not None:
+        cf["_family_booking_complete"] = True
+        tool_data = {k: v for k, v in {**cf, "group_preferences": gp}.items() if not k.startswith("_")}
+        return MachineResult(
+            state=state.model_copy(
+                update={"step": "ready", "collected_fields": {**cf, "group_preferences": gp}}
+            ),
+            reply="Got it — let me find times that work for everyone.",
+            ready_to_call=True,
+            tool_name="book_family_appointments",
+            tool_input_data=tool_data,
+            actions=[],
+            debug=machine._debug_snapshot(wf_def),
+        )
+
+    if d is not None and tod is None:
+        return MachineResult(
+            state=state.model_copy(
+                update={"step": "family:scheduling:time", "collected_fields": cf}
+            ),
+            reply="Got it — any preference for time of day (morning, afternoon, evening, or no preference)?",
+            ready_to_call=False,
+            actions=[ChatAction(type=ActionType.REQUEST_INFO, payload={"field": "preferred_time_of_day"})],
+            next_field="preferred_time_of_day",
+            debug=machine._debug_snapshot(wf_def),
+        )
+
+    if d is None and tod is not None:
+        gp["preferred_time_of_day"] = tod
+        cf["group_preferences"] = gp
+        return MachineResult(
+            state=state.model_copy(
+                update={"step": "family:scheduling:date", "collected_fields": cf}
+            ),
+            reply=(
+                f"What date should I use for that? (Today is {ref.strftime('%B %d, %Y')} — "
+                "e.g. next Tuesday or March 31.)"
+            ),
+            ready_to_call=False,
+            actions=[ChatAction(type=ActionType.REQUEST_INFO, payload={"field": "preferred_date_from"})],
+            next_field="preferred_date_from",
+            debug=machine._debug_snapshot(wf_def),
+        )
+
+    return MachineResult(
+        state=state.model_copy(update={"step": "family:scheduling:date", "collected_fields": cf}),
+        reply=(
+            f"No problem — what date or timeframe should I try instead? "
+            f"(Today is {ref.strftime('%B %d, %Y')} — you can say a weekday or a specific date.)"
+        ),
+        ready_to_call=False,
+        actions=[ChatAction(type=ActionType.REQUEST_INFO, payload={"field": "preferred_date_from"})],
+        next_field="preferred_date_from",
+        debug=machine._debug_snapshot(wf_def),
+    )
+
+
 def run_family_booking_turn(
     machine: Any,
     message: str,
@@ -24,6 +178,37 @@ def run_family_booking_turn(
 ) -> MachineResult | None:
     state = machine.state
     wf = WORKFLOWS[Workflow.FAMILY_BOOKING]
+
+    # Confirm roster (names / visits) before asking scheduling questions.
+    if state.step == "family:awaiting_member_confirm":
+        cf = dict(state.collected_fields)
+        from state_machine.extractors import extract_confirmation
+
+        confirmed = interp.extracted_fields.get("confirmation") if interp else None
+        if confirmed is None:
+            confirmed = extract_confirmation(message)
+        if confirmed is True:
+            return _start_scheduling(machine, wf_def, cf, wf)
+        if confirmed is False:
+            return MachineResult(
+                state=state.model_copy(
+                    update={"step": "family:member:0:name", "collected_fields": cf}
+                ),
+                reply=(
+                    "No problem — let’s adjust. Who’s the first family member we’re booking for? "
+                    "(Full name.)"
+                ),
+                ready_to_call=False,
+                actions=[],
+                debug=machine._debug_snapshot(wf_def),
+            )
+        return MachineResult(
+            state=state,
+            reply="I didn’t quite get that — does the family list look right?",
+            ready_to_call=False,
+            actions=[],
+            debug=machine._debug_snapshot(wf_def),
+        )
 
     # After we proposed concrete times — user must confirm before we book.
     if state.step == "awaiting_family_slot_confirmation":
@@ -46,18 +231,8 @@ def run_family_booking_turn(
                 debug=machine._debug_snapshot(wf_def),
             )
 
-        if confirmed is False:
-            cf = dict(state.collected_fields)
-            cf.pop("_family_proposed_slot_ids", None)
-            return MachineResult(
-                state=state.model_copy(
-                    update={"step": "family:scheduling:preference", "collected_fields": cf}
-                ),
-                reply="No problem — let's adjust. Same question as before: would you like visits back-to-back, or is same day fine?",
-                ready_to_call=False,
-                actions=[],
-                debug=machine._debug_snapshot(wf_def),
-            )
+        if confirmed is False or _family_slot_adjustment_intent(message, interp):
+            return _handle_family_slot_adjustment(machine, wf_def, message, interp, state, wf)
 
         return MachineResult(
             state=state,
@@ -70,6 +245,7 @@ def run_family_booking_turn(
             debug=machine._debug_snapshot(wf_def),
         )
 
+    # Generic awaiting_confirmation is not used for family scheduling (handled in family_booking).
     if state.step in ("awaiting_confirmation", "ready"):
         return None
 
@@ -116,7 +292,7 @@ def run_family_booking_turn(
         if len(members) < total:
             return _prompt_member_field(machine, wf_def, cf, len(members), "name", wf)
         if len(members) == total and _members_complete(members, total):
-            return _start_scheduling(machine, wf_def, cf, wf)
+            return _prompt_member_confirmation(machine, wf_def, cf, wf)
         return None
 
     idx = int(m.group(1))
@@ -138,6 +314,12 @@ def run_family_booking_turn(
     if sub == "name":
         return _prompt_member_field(machine, wf_def, cf, idx, "relation", wf)
     if sub == "relation":
+        if _is_self_relation(row.get("relation")):
+            row = dict(row)
+            row["patient_status"] = "existing"
+            members[idx] = row
+            cf["family_members"] = members
+            return _prompt_member_field(machine, wf_def, cf, idx, "appointment", wf)
         return _prompt_member_field(machine, wf_def, cf, idx, "status", wf)
     if sub == "status":
         return _prompt_member_field(machine, wf_def, cf, idx, "appointment", wf)
@@ -146,11 +328,11 @@ def run_family_booking_turn(
             return _prompt_member_field(machine, wf_def, cf, idx, "dob", wf)
         if idx + 1 < total:
             return _prompt_member_field(machine, wf_def, cf, idx + 1, "name", wf)
-        return _start_scheduling(machine, wf_def, cf, wf)
+        return _prompt_member_confirmation(machine, wf_def, cf, wf)
     if sub == "dob":
         if idx + 1 < total:
             return _prompt_member_field(machine, wf_def, cf, idx + 1, "name", wf)
-        return _start_scheduling(machine, wf_def, cf, wf)
+        return _prompt_member_confirmation(machine, wf_def, cf, wf)
 
     return None
 
@@ -234,6 +416,25 @@ def _prompt_member_field(
     )
 
 
+def _prompt_member_confirmation(machine: Any, wf_def: WorkflowDef, cf: dict[str, Any], wf: Any) -> MachineResult:
+    summary = family_members_summary_markdown(cf)
+    reply = (
+        "Here’s who I have for the family booking:\n\n"
+        f"{summary}\n\n"
+        "Does that look right before we pick dates and times?"
+    )
+    return MachineResult(
+        state=machine.state.model_copy(
+            update={"step": "family:awaiting_member_confirm", "collected_fields": cf}
+        ),
+        reply=reply,
+        ready_to_call=False,
+        next_field="confirmation",
+        actions=[ChatAction(type=ActionType.CONFIRM_BOOKING, payload={"summary": summary})],
+        debug=machine._debug_snapshot(wf_def),
+    )
+
+
 def _start_scheduling(machine: Any, wf_def: WorkflowDef, cf: dict[str, Any], wf: Any) -> MachineResult:
     return MachineResult(
         state=machine.state.model_copy(
@@ -274,11 +475,15 @@ def _handle_scheduling_preference(
     gp = dict(cf.get("group_preferences") or {})
     gp["group_preference"] = pref
     cf["group_preferences"] = gp
+    today = date.today()
     return MachineResult(
         state=machine.state.model_copy(
             update={"step": "family:scheduling:date", "collected_fields": cf}
         ),
-        reply="What date or rough timeframe works best (e.g. next week, March 15)?",
+        reply=(
+            f"What date or rough timeframe works best? "
+            f"(Today is {today.strftime('%B %d, %Y')} — e.g. next week, tomorrow, or a specific day.)"
+        ),
         actions=[ChatAction(type=ActionType.REQUEST_INFO, payload={"field": "preferred_date_from"})],
         next_field="preferred_date_from",
         debug=machine._debug_snapshot(wf_def),
@@ -290,17 +495,23 @@ def _handle_scheduling_date(
 ) -> MachineResult:
     from state_machine.extractors import extract_preferred_date
 
-    d = extract_preferred_date(message)
+    ref = date.today()
+    d = extract_preferred_date(message, today=ref)
     if d is None and interp and getattr(interp, "extracted_fields", None):
         pdf = interp.extracted_fields.get("preferred_date_from")
         if isinstance(pdf, date):
-            d = pdf
+            d = pdf if pdf >= ref else None
         elif isinstance(pdf, str):
-            d = extract_preferred_date(pdf)
+            d = extract_preferred_date(pdf, today=ref)
+    if d is not None and d < ref:
+        d = ref
     if d is None:
         return MachineResult(
             state=machine.state,
-            reply="I couldn’t read that date — try next Tuesday, March 20, or April 5.",
+            reply=(
+                f"I couldn’t read that date — try next Tuesday, tomorrow, or any day on or after "
+                f"{ref.strftime('%B %d, %Y')}."
+            ),
             actions=[],
             debug=machine._debug_snapshot(wf_def),
         )
@@ -331,15 +542,16 @@ def _handle_scheduling_time(
     gp["preferred_time_of_day"] = tod
     cf["group_preferences"] = gp
     cf["_family_booking_complete"] = True
-    summary = machine._build_family_booking_summary()
-    reply = f"{wf.ready_message}\n\n{summary}\n\nDoes everything look correct?"
+    tool_data = {k: v for k, v in {**cf, "group_preferences": gp}.items() if not k.startswith("_")}
     return MachineResult(
         state=machine.state.model_copy(
-            update={"step": "awaiting_confirmation", "collected_fields": {**cf, "group_preferences": gp}}
+            update={"step": "ready", "collected_fields": {**cf, "group_preferences": gp}}
         ),
-        reply=reply,
-        actions=[ChatAction(type=ActionType.CONFIRM_BOOKING, payload={"summary": summary})],
-        next_field="confirmation",
+        reply="Got it — let me find times that work for everyone.",
+        ready_to_call=True,
+        tool_name="book_family_appointments",
+        tool_input_data=tool_data,
+        actions=[],
         debug=machine._debug_snapshot(wf_def),
     )
 
@@ -411,10 +623,10 @@ def _apply_member_substep(
     return False, None, members
 
 
-def family_booking_summary_markdown(cf: dict[str, Any]) -> str:
+def family_members_summary_markdown(cf: dict[str, Any]) -> str:
+    """Roster only — used before scheduling questions (no date/time)."""
     lines: list[str] = []
     members = cf.get("family_members") or []
-    gp = cf.get("group_preferences") or {}
     for i, m in enumerate(members):
         name = f"{m.get('first_name', '')} {m.get('last_name', '')}".strip()
         lines.append(f"**Member {i + 1}** — {name}")
@@ -425,12 +637,20 @@ def family_booking_summary_markdown(cf: dict[str, Any]) -> str:
         if isinstance(dob, date):
             lines.append(f"  • DOB: {dob.isoformat()}")
         lines.append("")
-    lines.append("**Scheduling**")
-    lines.append(f"  • Group preference: {gp.get('group_preference', '')}")
+    return "\n".join(lines).strip()
+
+
+def family_booking_summary_markdown(cf: dict[str, Any]) -> str:
+    """Roster plus scheduling prefs when present (debug / dashboards)."""
+    base = family_members_summary_markdown(cf)
+    gp = cf.get("group_preferences") or {}
+    if not gp:
+        return base
+    lines = [base, "", "**Scheduling**", f"  • Group preference: {gp.get('group_preference', '')}"]
     pd = gp.get("preferred_date_from")
     if isinstance(pd, date):
         lines.append(f"  • Preferred date: {pd.isoformat()}")
-    else:
+    elif pd:
         lines.append(f"  • Preferred date: {pd}")
     lines.append(f"  • Time of day: {gp.get('preferred_time_of_day', 'any')}")
     return "\n".join(lines).strip()

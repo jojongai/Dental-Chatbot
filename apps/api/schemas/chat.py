@@ -71,6 +71,8 @@ IDENTITY_FIELD_KEYS: frozenset[str] = frozenset({
     "insurance_name",
     # Optional trusted label from chart / lookup (never inferred booking intent)
     "patient_status",
+    # Full name from DB after successful lookup_patient (cancel/reschedule confirmations)
+    "_verified_patient_name",
 })
 
 # Machine / router steps that mean "the last workflow finished; next message is a new request."
@@ -81,21 +83,11 @@ THREAD_TERMINAL_STEPS: frozenset[str] = frozenset({"confirmed", "done"})
 MAYA_THREAD_CLOSURE_SIGNOFF = "If you need anything else, just let me know."
 
 
-def workflow_state_after_completed_flow(state: WorkflowState | None) -> WorkflowState:
+def _identity_reset_state(state: WorkflowState | None, *, step: str) -> WorkflowState:
     """
-    After a workflow completes (or when starting a brand-new conversation thread):
-    keep verified identity + patient linkage; drop all workflow-specific fields and
-    UI/booking state so the next inbound message is routed as a fresh intent.
-
-    Preserved (when present on ``state``):
-        patient_id, conversation_id, and keys in IDENTITY_FIELD_KEYS inside collected_fields.
-
-    Cleared:
-        workflow (reset to GENERAL_INQUIRY), step (start), missing_fields,
-        appointment_id, appointment_request_id, family_group_id,
-        last_clinic_category, slot_options, selected_slot_id, appointment_options,
-        and any collected_fields not in IDENTITY_FIELD_KEYS (appointment_type, dates,
-        cancel_reason, emergency_summary, family booking keys, _pending_workflow, etc.).
+    Drop workflow-specific fields; keep identity + patient linkage.
+    ``step`` is ``start`` (ready for the next intent) or ``done`` (terminal reply — client echoes
+    this so the next POST hits ``THREAD_TERMINAL_STEPS`` and resets again to ``start``).
     """
     if state is None:
         return WorkflowState()
@@ -103,7 +95,7 @@ def workflow_state_after_completed_flow(state: WorkflowState | None) -> Workflow
     identity = {k: v for k, v in old_cf.items() if k in IDENTITY_FIELD_KEYS}
     return WorkflowState(
         workflow=Workflow.GENERAL_INQUIRY,
-        step="start",
+        step=step,
         collected_fields=identity,
         missing_fields=[],
         patient_id=state.patient_id,
@@ -116,6 +108,23 @@ def workflow_state_after_completed_flow(state: WorkflowState | None) -> Workflow
         selected_slot_id=None,
         appointment_options=[],
     )
+
+
+def workflow_state_after_completed_flow(state: WorkflowState | None) -> WorkflowState:
+    """
+    Reset used when the client sends ``step='done'`` (terminal echo) or ``new_conversation``:
+    identity only + ``step=start`` for the state machine.
+    """
+    return _identity_reset_state(state, step="start")
+
+
+def workflow_state_terminal_reply(state: WorkflowState | None) -> WorkflowState:
+    """
+    Outbound state after a completed booking/cancel/reschedule/etc.
+    Use ``step='done'`` so the client echoes it; ``post_chat`` then applies
+    ``workflow_state_after_completed_flow`` and the next turn starts clean (fixes stale workflow).
+    """
+    return _identity_reset_state(state, step="done")
 
 
 def workflow_state_for_new_conversation(state: WorkflowState | None) -> WorkflowState:

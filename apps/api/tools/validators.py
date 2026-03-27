@@ -91,6 +91,24 @@ def normalize_appointment_type(raw: str) -> AppointmentTypeCode:
     )
 
 
+_APPOINTMENT_TYPE_DISPLAY: dict[str, str] = {
+    "cleaning": "Cleaning",
+    "general_checkup": "Check-up",
+    "new_patient_exam": "New patient exam",
+    "emergency": "Emergency visit",
+}
+
+
+def display_name_for_appointment_type(code: str | None) -> str:
+    """Plain-English label for confirmations and UI (canonical code → short phrase)."""
+    if not code:
+        return "—"
+    key = str(code).strip().lower()
+    if key in _APPOINTMENT_TYPE_DISPLAY:
+        return _APPOINTMENT_TYPE_DISPLAY[key]
+    return key.replace("_", " ").title()
+
+
 def validate_dob(dob: date) -> date:
     """
     Validate that date_of_birth is in the past and realistic.

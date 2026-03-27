@@ -123,7 +123,7 @@ class TestNewPatientRegistration:
         result = run(state, "I'd like a cleaning")
         assert result.state.collected_fields.get("appointment_type") == "cleaning"
 
-    def test_not_ready_until_preferred_date_collected(self):
+    def test_registration_asks_confirmation_when_all_fields_collected(self):
         state = make_state(
             workflow=Workflow.NEW_PATIENT_REGISTRATION,
             step="collecting",
@@ -138,7 +138,8 @@ class TestNewPatientRegistration:
         )
         result = run(state, "hello")
         assert result.ready_to_call is False
-        assert "preferred_date_from" in result.state.missing_fields
+        assert result.state.step == "awaiting_confirmation"
+        assert "preferred_date_from" not in result.state.missing_fields
 
     def test_ready_when_all_required_fields_present(self):
         all_fields = {
@@ -148,7 +149,6 @@ class TestNewPatientRegistration:
             "date_of_birth": date(1990, 3, 14),
             "insurance_name": "self_pay",
             "appointment_type": "cleaning",
-            "preferred_date_from": date(2026, 4, 7),
         }
         state = make_state(
             workflow=Workflow.NEW_PATIENT_REGISTRATION,
@@ -467,6 +467,32 @@ class TestFamilyBooking:
 
     def test_tool_name_is_family_booking(self):
         assert WORKFLOWS[Workflow.FAMILY_BOOKING].tool_name == "book_family_appointments"
+
+    def test_self_relation_skips_new_existing_question(self):
+        state = make_state(
+            workflow=Workflow.FAMILY_BOOKING,
+            step="family:member:1:relation",
+            patient_id="p1",
+            collected_fields={
+                "family_count": 2,
+                "family_members": [
+                    {
+                        "first_name": "Jane",
+                        "last_name": "Doe",
+                        "relation": "child",
+                        "patient_status": "existing",
+                        "appointment_type": "cleaning",
+                    },
+                    {"first_name": "Jojo", "last_name": "Ngai"},
+                ],
+            },
+        )
+        result = run(state, "self")
+        assert result.state.step == "family:member:1:appointment"
+        members = result.state.collected_fields.get("family_members") or []
+        assert members[1].get("relation") == "self"
+        assert members[1].get("patient_status") == "existing"
+        assert "new or an existing" not in result.reply.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -829,8 +855,9 @@ class TestPreferredDateExtractor:
         """'next week' should be stored as a date object, not the raw string."""
         from datetime import date as _date
         state = make_state(
-            workflow=Workflow.NEW_PATIENT_REGISTRATION,
+            workflow=Workflow.BOOK_APPOINTMENT,
             step="collecting:preferred_date_from",
+            patient_id="patient-test-001",
             collected_fields={
                 "first_name": "Test",
                 "last_name": "User",
@@ -843,6 +870,8 @@ class TestPreferredDateExtractor:
         result = run(state, "next week")
         pdf = result.state.collected_fields.get("preferred_date_from")
         assert isinstance(pdf, _date), f"Expected date object, got {type(pdf)}: {pdf}"
+        assert result.state.collected_fields.get("first_name") == "Test"
+        assert result.state.collected_fields.get("last_name") == "User"
 
     def test_next_week_friday_is_friday_not_monday(self):
         from datetime import date

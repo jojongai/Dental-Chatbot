@@ -146,6 +146,15 @@ def test_normalize_phone_strips_formatting() -> None:
     assert normalize_appointment_type("new patient exam") == "new_patient_exam"
 
 
+def test_display_name_for_appointment_type() -> None:
+    from tools.validators import display_name_for_appointment_type
+
+    assert display_name_for_appointment_type("general_checkup") == "Check-up"
+    assert display_name_for_appointment_type("cleaning") == "Cleaning"
+    assert display_name_for_appointment_type("new_patient_exam") == "New patient exam"
+    assert display_name_for_appointment_type("emergency") == "Emergency visit"
+
+
 def test_normalize_phone_raises_on_bad_input() -> None:
     from tools.validators import normalize_phone
 
@@ -253,6 +262,34 @@ def test_create_patient_duplicate_phone(db: Session) -> None:
     )
     assert not result2.success
     assert "already exists" in (result2.error or "")
+
+
+def test_create_patient_shared_household_phone_family_member(db: Session) -> None:
+    """Dependents often share the primary contact's number — family booking may create a second chart."""
+    create_patient(
+        db,
+        CreatePatientInput(
+            first_name="Primary",
+            last_name="Contact",
+            phone_number="(416) 888-2222",
+            date_of_birth=date(1985, 4, 4),
+        ),
+        practice_id="p1",
+    )
+    result2 = create_patient(
+        db,
+        CreatePatientInput(
+            first_name="Sibling",
+            last_name="Member",
+            phone_number="4168882222",
+            date_of_birth=date(2005, 1, 1),
+        ),
+        practice_id="p1",
+        allow_shared_household_phone=True,
+    )
+    assert result2.success
+    assert result2.patient is not None
+    assert result2.patient.first_name == "Sibling"
 
 
 # ---------------------------------------------------------------------------

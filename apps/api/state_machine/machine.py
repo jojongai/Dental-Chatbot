@@ -117,6 +117,31 @@ class MachineResult:
 # Workflow intent detection (opening turn / mid-flow guard)
 # ---------------------------------------------------------------------------
 
+# Verbal pivots while mid-flow — also used to refresh the same workflow when the user repeats intent.
+_MIDFLOW_OVERRIDE_PHRASES: tuple[tuple[str, Workflow], ...] = (
+    ("actually i want to cancel", Workflow.CANCEL_APPOINTMENT),
+    ("actually cancel", Workflow.CANCEL_APPOINTMENT),
+    ("i need to cancel instead", Workflow.CANCEL_APPOINTMENT),
+    ("actually i want to reschedule", Workflow.RESCHEDULE_APPOINTMENT),
+    ("actually reschedule", Workflow.RESCHEDULE_APPOINTMENT),
+    ("i need to reschedule instead", Workflow.RESCHEDULE_APPOINTMENT),
+    ("actually i want to book", Workflow.BOOK_APPOINTMENT),
+    ("actually book", Workflow.BOOK_APPOINTMENT),
+    ("speak to someone", Workflow.HANDOFF),
+    ("talk to a person", Workflow.HANDOFF),
+    ("talk to someone", Workflow.HANDOFF),
+    ("speak to a human", Workflow.HANDOFF),
+)
+
+
+def midflow_override_target(message: str) -> Workflow | None:
+    """If ``message`` matches a mid-flow pivot phrase, return that workflow; else None."""
+    lower = message.lower()
+    for phrase, target in _MIDFLOW_OVERRIDE_PHRASES:
+        if phrase in lower:
+            return target
+    return None
+
 
 def detect_intent(message: str, current: WorkflowState) -> Workflow:
     """
@@ -153,24 +178,10 @@ def detect_intent(message: str, current: WorkflowState) -> Workflow:
         if _is_emergency(lower) and current.workflow != Workflow.EMERGENCY_TRIAGE:
             return Workflow.EMERGENCY_TRIAGE
 
-        # "Actually I want to X instead" — clear verbal pivot
-        _MIDFLOW_OVERRIDES = (
-            ("actually i want to cancel", Workflow.CANCEL_APPOINTMENT),
-            ("actually cancel", Workflow.CANCEL_APPOINTMENT),
-            ("i need to cancel instead", Workflow.CANCEL_APPOINTMENT),
-            ("actually i want to reschedule", Workflow.RESCHEDULE_APPOINTMENT),
-            ("actually reschedule", Workflow.RESCHEDULE_APPOINTMENT),
-            ("i need to reschedule instead", Workflow.RESCHEDULE_APPOINTMENT),
-            ("actually i want to book", Workflow.BOOK_APPOINTMENT),
-            ("actually book", Workflow.BOOK_APPOINTMENT),
-            ("speak to someone", Workflow.HANDOFF),
-            ("talk to a person", Workflow.HANDOFF),
-            ("talk to someone", Workflow.HANDOFF),
-            ("speak to a human", Workflow.HANDOFF),
-        )
-        for phrase, target in _MIDFLOW_OVERRIDES:
-            if phrase in lower and current.workflow != target:
-                return target
+        # "Actually I want to X instead" — clear verbal pivot (same target as current is handled in process()).
+        pivot = midflow_override_target(message)
+        if pivot is not None:
+            return pivot
 
         return current.workflow  # stay in current workflow
 
@@ -202,6 +213,25 @@ def _registration_followup_agrees_to_register(out: Any) -> bool:
 # ---------------------------------------------------------------------------
 # State machine
 # ---------------------------------------------------------------------------
+
+
+def compute_missing_fields(workflow: Workflow, collected: dict[str, Any]) -> list[str]:
+    """Return required field keys not yet satisfied for ``workflow``."""
+    wf_def = WORKFLOWS[workflow]
+    missing: list[str] = []
+    for field_key in wf_def.required_fields:
+        field_def = FIELDS.get(field_key)
+        if field_def and field_def.multi_key:
+            if field_key == "first_name":
+                if "first_name" not in collected or "last_name" not in collected:
+                    missing.append(field_key)
+            else:
+                if field_key not in collected:
+                    missing.append(field_key)
+        else:
+            if field_key not in collected:
+                missing.append(field_key)
+    return missing
 
 
 class WorkflowStateMachine:
@@ -248,7 +278,26 @@ class WorkflowStateMachine:
         workflow = detect_intent(message, self.state)
         wf_def = WORKFLOWS[workflow]
 
-        # 2a. Workflow sync: if detect_intent returned a different workflow
+        # 2a. Same-workflow pivot: user repeats "actually I want to cancel" while stuck in cancel, etc.
+        pivot_wf = midflow_override_target(message)
+        if (
+            pivot_wf is not None
+            and pivot_wf == workflow == self.state.workflow
+            and self.state.workflow != Workflow.GENERAL_INQUIRY
+        ):
+            self.state = self.state.model_copy(
+                update={
+                    "step": "collecting",
+                    "collected_fields": _carry_forward_fields(self.state.collected_fields),
+                    "missing_fields": [],
+                    "appointment_id": None,
+                    "appointment_options": [],
+                    "slot_options": [],
+                    "selected_slot_id": None,
+                }
+            )
+
+        # 2b. Workflow sync: if detect_intent returned a different workflow
         #     (e.g. failed-lookup → NEW_PATIENT_REGISTRATION), reset state.
         if workflow != self.state.workflow and self.state.workflow != Workflow.GENERAL_INQUIRY:
             self.state = self.state.model_copy(
@@ -262,7 +311,7 @@ class WorkflowStateMachine:
                 }
             )
 
-        # 2b. Patient-type gate: ask "new or existing?" before verification pivot.
+        # 2c. Patient-type gate: ask "new or existing?" before verification pivot.
         #     Also handles returning from the gate when step == awaiting_patient_type.
         gate_result = self._patient_type_gate(message, workflow, wf_def)
         if gate_result is not None:
@@ -437,6 +486,12 @@ class WorkflowStateMachine:
                 "Maya listed specific appointment times for each family member and asked whether "
                 "to go ahead and reserve those times."
             )
+        elif self.state.step == "family:awaiting_member_confirm":
+            pending_field = "confirmation"
+            pending_question = (
+                "Maya listed each family member’s name, relation, patient status, and visit type "
+                "and asked whether that’s correct before scheduling dates and times."
+            )
 
         clean_collected = {
             k: v for k, v in self.state.collected_fields.items() if not k.startswith("_")
@@ -523,26 +578,7 @@ class WorkflowStateMachine:
     # ------------------------------------------------------------------
 
     def _compute_missing(self, wf_def: WorkflowDef) -> list[str]:
-        """
-        Return required fields that are not yet in collected_fields.
-        """
-        collected = self.state.collected_fields
-        missing: list[str] = []
-
-        for field_key in wf_def.required_fields:
-            field_def = FIELDS.get(field_key)
-            if field_def and field_def.multi_key:
-                if field_key == "first_name":
-                    if "first_name" not in collected or "last_name" not in collected:
-                        missing.append(field_key)
-                else:
-                    if field_key not in collected:
-                        missing.append(field_key)
-            else:
-                if field_key not in collected:
-                    missing.append(field_key)
-
-        return missing
+        return compute_missing_fields(wf_def.workflow, self.state.collected_fields)
 
     # ------------------------------------------------------------------
     # Reply builders
@@ -691,6 +727,8 @@ class WorkflowStateMachine:
     # ------------------------------------------------------------------
 
     def _build_summary(self) -> str:
+        from tools.validators import display_name_for_appointment_type
+
         cf = self.state.collected_fields
         lines: list[str] = []
 
@@ -700,12 +738,17 @@ class WorkflowStateMachine:
                 val_str = val.strftime("%B %d, %Y") if isinstance(val, date) else str(val)
                 lines.append(f"• **{label}**: {val_str}")
 
+        def _fmt_appt_type(key: str, label: str) -> None:
+            val = cf.get(key)
+            if val is not None:
+                lines.append(f"• **{label}**: {display_name_for_appointment_type(str(val))}")
+
         _fmt("first_name", "First name")
         _fmt("last_name", "Last name")
         _fmt("phone_number", "Phone")
         _fmt("date_of_birth", "Date of birth")
         _fmt("insurance_name", "Insurance")
-        _fmt("appointment_type", "Appointment type")
+        _fmt_appt_type("appointment_type", "Appointment type")
         _fmt("preferred_date_from", "Preferred date")
         _fmt("preferred_time_of_day", "Preferred time")
         _fmt("emergency_summary", "Emergency description")
@@ -720,11 +763,20 @@ class WorkflowStateMachine:
         from state_machine.extractors import is_false_positive_name_pair
 
         cf = self.state.collected_fields
+        verified = (cf.get("_verified_patient_name") or "").strip()
         fn = (cf.get("first_name") or "").strip()
         ln = (cf.get("last_name") or "").strip()
         if is_false_positive_name_pair(fn, ln):
             fn, ln = "", ""
-        name = f"{fn} {ln}".strip() or "—"
+        typed = f"{fn} {ln}".strip()
+        # Typed name wins when present (user correction). Chart name from lookup when
+        # cancel-reason / LLM noise wiped or spoofed first+last (e.g. "Scheduling Issue").
+        if typed:
+            name = typed
+        elif verified:
+            name = verified
+        else:
+            name = "—"
         date_l = (cf.get("_cancel_appointment_date_label") or "").strip() or "—"
         time_l = (cf.get("_cancel_appointment_time_label") or "").strip() or "—"
         reason = cf.get("cancel_reason")
@@ -864,7 +916,7 @@ def _safe_workflow(label: str) -> Workflow | None:
 
 def _carry_forward_fields(collected: dict[str, Any]) -> dict[str, Any]:
     """Keep name and phone when switching workflows — avoids re-asking."""
-    keep = {"first_name", "last_name", "phone_number"}
+    keep = {"first_name", "last_name", "phone_number", "_verified_patient_name"}
     return {k: v for k, v in collected.items() if k in keep}
 
 

@@ -30,8 +30,14 @@ from schemas.chat import (
     WorkflowState,
     workflow_state_after_completed_flow,
     workflow_state_for_new_conversation,
+    workflow_state_terminal_reply,
 )
-from state_machine.machine import MachineResult, WorkflowStateMachine, machine_status
+from state_machine.machine import (
+    MachineResult,
+    WorkflowStateMachine,
+    compute_missing_fields,
+    machine_status,
+)
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -131,25 +137,30 @@ def _list_appointments_if_known_patient_skipped_verification(
     After lookup, cancel/reschedule always list appointments before intake.
 
     If the patient **already** has ``patient_id`` (e.g. post–terminal reset),
-    the machine used to jump straight to ``preferred_date_from`` (reschedule) or
-    ``cancel_reason`` (cancel) without picking an appointment. Same fix for both:
-    replace that turn with the numbered appointment list + ``_pending_workflow``.
+    the machine must not jump straight to date/reason/confirmation without picking
+    an appointment. We also replace bogus turns (e.g. ``awaiting_confirmation`` with
+    extracted junk names) by stripping non-identity fields and showing the list again.
     """
     s = result.state
     if not s.patient_id or s.appointment_id:
         return None
     if s.workflow not in (Workflow.RESCHEDULE_APPOINTMENT, Workflow.CANCEL_APPOINTMENT):
         return None
+    # Already showing the pick-list for this flow
     if s.step == "selecting_appointment" and s.appointment_options:
         return None
-    if result.next_field not in ("preferred_date_from", "cancel_reason"):
-        return None
-    if result.ready_to_call:
-        return None
 
-    cf = {**s.collected_fields, "_pending_workflow": s.workflow.value}
-    list_state = s.model_copy(update={"collected_fields": cf, "missing_fields": []})
-    fn = (list_state.collected_fields.get("first_name") or "").strip() or None
+    # Wipe scheduling fields and bogus extractions; keep only identity + pending workflow.
+    identity_cf = {k: v for k, v in (s.collected_fields or {}).items() if k in IDENTITY_FIELD_KEYS}
+    cf = {**identity_cf, "_pending_workflow": s.workflow.value}
+    list_state = s.model_copy(
+        update={
+            "collected_fields": cf,
+            "missing_fields": [],
+            "step": "collecting",
+        }
+    )
+    fn = (identity_cf.get("first_name") or "").strip() or None
     if not fn:
         fn = _first_name_from_patient_db(db, s.patient_id) or "there"
     reply, new_state = _list_and_present_appointments(list_state, db, fn)
@@ -333,6 +344,29 @@ def _run_machine(state: WorkflowState, message: str):
 # ---------------------------------------------------------------------------
 
 
+def _state_after_registration_for_booking(state: WorkflowState, patient_id: str) -> WorkflowState:
+    """After create_patient, continue as book_appointment (date → search_slots)."""
+    cf = {
+        k: v
+        for k, v in (state.collected_fields or {}).items()
+        if not k.startswith("_")
+    }
+    cf.pop("preferred_date_from", None)
+    missing = compute_missing_fields(Workflow.BOOK_APPOINTMENT, cf)
+    next_field = missing[0] if missing else "preferred_date_from"
+    return state.model_copy(
+        update={
+            "workflow": Workflow.BOOK_APPOINTMENT,
+            "patient_id": patient_id,
+            "step": f"collecting:{next_field}",
+            "collected_fields": cf,
+            "missing_fields": missing,
+            "slot_options": [],
+            "selected_slot_id": None,
+        }
+    )
+
+
 def _dispatch_tool(
     tool_name: str,
     tool_input_data: dict,
@@ -346,7 +380,7 @@ def _dispatch_tool(
     Call the appropriate tool and return (reply, updated_state, tools_called).
 
     NEW PATIENT BOOKING multi-step:
-      create_patient → auto search_slots → present options → user picks → book_appointment
+      create_patient → transition to book_appointment (date + slots) → search_slots → book_appointment
     """
     try:
         match tool_name:
@@ -409,7 +443,19 @@ def _dispatch_tool(
                 # ── Verified ─────────────────────────────────────────────────
                 if result.found and result.patient:
                     p = result.patient
-                    verified_state = state.model_copy(update={"patient_id": p.id})
+                    fn_chart = (p.first_name or "").strip()
+                    ln_chart = (p.last_name or "").strip()
+                    verified_state = state.model_copy(
+                        update={
+                            "patient_id": p.id,
+                            "collected_fields": {
+                                **state.collected_fields,
+                                "first_name": fn_chart,
+                                "last_name": ln_chart,
+                                "_verified_patient_name": f"{fn_chart} {ln_chart}".strip(),
+                            },
+                        }
+                    )
                     return _resume_pending_workflow(verified_state, db, p.first_name, tool_input_data)
 
                 # ── Duplicate records — ask for email as tiebreaker ──────────
@@ -458,7 +504,7 @@ def _dispatch_tool(
                 return not_found_msg, retry_state, ["lookup_patient"]
 
             # ------------------------------------------------------------------
-            # New patient registration → immediately search slots on success
+            # New patient registration → book_appointment flow (date, then search_slots)
             # ------------------------------------------------------------------
             case "create_patient":
                 from schemas.tools import CreatePatientInput
@@ -479,6 +525,14 @@ def _dispatch_tool(
                         )
                         if lookup_result.found and lookup_result.patient:
                             p = lookup_result.patient
+                            if state.workflow == Workflow.NEW_PATIENT_REGISTRATION:
+                                new_state = _state_after_registration_for_booking(state, p.id)
+                                fn = (p.first_name or "there").strip()
+                                reply = (
+                                    f"It looks like you're already in our system, {fn}! "
+                                    "When would you like your appointment?"
+                                )
+                                return reply, new_state, ["create_patient", "lookup_patient"]
                             verified_state = state.model_copy(update={"patient_id": p.id})
                             reply, vs, resume_tools = _resume_pending_workflow(
                                 verified_state, db, p.first_name, tool_input_data
@@ -494,13 +548,13 @@ def _dispatch_tool(
                             )
                     return f"I couldn't register you: {result.error}", state, ["create_patient"]
 
-                # Store patient_id, then immediately search slots
-                new_state = state.model_copy(update={"patient_id": result.patient.id})
-                reply, new_state, slot_tools = _search_and_present_slots(
-                    tool_input_data, new_state, db,
-                    preamble=f"Welcome {result.patient.first_name}! You're all registered."
+                fn = (result.patient.first_name or "there").strip()
+                new_state = _state_after_registration_for_booking(state, result.patient.id)
+                reply = (
+                    f"Welcome {fn}! You're all registered. "
+                    "When would you like your appointment?"
                 )
-                return reply, new_state, ["create_patient"] + slot_tools
+                return reply, new_state, ["create_patient"]
 
             # ------------------------------------------------------------------
             # Slot search (existing patient booking)
@@ -541,7 +595,7 @@ def _dispatch_tool(
                     f"Done — your {a.appointment_type_display} on {a.date_label} at {a.time_label} "
                     "has been cancelled."
                 )
-                new_state = workflow_state_after_completed_flow(state)
+                new_state = workflow_state_terminal_reply(state)
                 return reply, new_state, ["cancel_appointment"]
 
             # ------------------------------------------------------------------
@@ -668,7 +722,7 @@ def _list_and_present_appointments(
             f"I looked up your file, {first_name}, but I don't see any upcoming appointments. "
             f"Nothing to {action} right now!"
         )
-        new_state = workflow_state_after_completed_flow(state)
+        new_state = workflow_state_terminal_reply(state)
         return reply, new_state
 
     pending = state.collected_fields.get("_pending_workflow", "")
@@ -1121,7 +1175,7 @@ def _handle_slot_selection(
         )
 
     confirm_reply = _append_maya_thread_signoff(confirm_reply)
-    new_state = workflow_state_after_completed_flow(
+    new_state = workflow_state_terminal_reply(
         state.model_copy(update={"patient_id": patient_id}) if patient_id else state
     )
     return ChatResponse(
@@ -1360,7 +1414,7 @@ def _dispatch_emergency_notification(
         "this has been flagged as urgent. Please don't wait if you're in severe pain; "
         "go to your nearest emergency dental clinic or call 911 if it's a medical emergency."
     )
-    new_state = workflow_state_after_completed_flow(state)
+    new_state = workflow_state_terminal_reply(state)
     return reply, new_state, tools_called
 
 
@@ -1385,11 +1439,17 @@ def _dispatch_family_booking(
     from models.patient import Patient
     from schemas.appointment import FamilyBookingMemberIn
     from schemas.tools import BookFamilyAppointmentsInput, CreatePatientInput, CreateStaffNotificationInput, LookupPatientInput
+    from tools.family_tools import (
+        ensure_patients_in_same_family_group,
+        find_patient_in_family_group_by_name,
+        get_family_group_for_primary,
+    )
     from tools.patient_tools import create_patient, lookup_patient
     from tools.scheduling_tools import (
         assign_family_appointment_slots,
         book_family_appointments,
         book_family_appointments_from_proposed_slots,
+        normalize_group_preference,
     )
     from tools.notification_tools import create_staff_notification
     from tools.validators import fmt_date, fmt_time_range, normalize_appointment_type
@@ -1404,7 +1464,9 @@ def _dispatch_family_booking(
             [],
         )
 
-    raw_members = tool_input_data.get("family_members") or []
+    raw_members = tool_input_data.get("family_members") or (
+        (state.collected_fields or {}).get("family_members") or []
+    )
     gp = tool_input_data.get("group_preferences") or {}
     if not raw_members:
         return (
@@ -1417,7 +1479,10 @@ def _dispatch_family_booking(
     primary_phone = primary.phone_number if primary else ""
 
     preferred_time_global = gp.get("preferred_time_of_day") or tool_input_data.get("preferred_time_of_day") or "any"
-    group_pref = gp.get("group_preference") or tool_input_data.get("group_preference") or "back_to_back"
+    raw_gp = gp.get("group_preference") or tool_input_data.get("group_preference")
+    group_pref = normalize_group_preference(
+        str(raw_gp).strip() if raw_gp is not None else None
+    )
 
     date_from = gp.get("preferred_date_from") or tool_input_data.get("preferred_date_from") or _date.today() + timedelta(days=1)
     if isinstance(date_from, str):
@@ -1449,37 +1514,55 @@ def _dispatch_family_booking(
         if rel == "self" or rel in ("me", "myself", "i"):
             pid = state.patient_id
         else:
-            lu = lookup_patient(
-                db,
-                LookupPatientInput(first_name=fn, last_name=ln, phone_number=primary_phone),
-                practice_id=practice_id,
-            )
-            if lu.found and lu.patient:
-                pid = lu.patient.id
-            elif status == "new" and m.get("date_of_birth"):
-                dob = m["date_of_birth"]
-                if isinstance(dob, str):
-                    try:
-                        dob = _date.fromisoformat(dob)
-                    except ValueError:
-                        dob = None
-                if dob is not None:
-                    cp = create_patient(
-                        db,
-                        CreatePatientInput(
-                            first_name=fn or "Family",
-                            last_name=ln or "Member",
-                            phone_number=primary_phone,
-                            date_of_birth=dob,
-                        ),
-                        practice_id=practice_id,
-                    )
-                    if cp.success and cp.patient:
-                        pid = cp.patient.id
+            pid = None
+            # Prefer charts already linked on the verified primary's family group (household roster).
+            fg = get_family_group_for_primary(db, practice_id, state.patient_id)
+            if fg and fn and ln:
+                fp = find_patient_in_family_group_by_name(db, fg.id, fn, ln)
+                if fp:
+                    pid = fp.id
+            if pid is None:
+                lu = lookup_patient(
+                    db,
+                    LookupPatientInput(first_name=fn, last_name=ln, phone_number=primary_phone),
+                    practice_id=practice_id,
+                )
+                if lu.found and lu.patient:
+                    pid = lu.patient.id
+                elif status == "new" and m.get("date_of_birth"):
+                    dob = m["date_of_birth"]
+                    if isinstance(dob, str):
+                        try:
+                            dob = _date.fromisoformat(dob)
+                        except ValueError:
+                            dob = None
+                    if dob is not None:
+                        cp = create_patient(
+                            db,
+                            CreatePatientInput(
+                                first_name=fn or "Family",
+                                last_name=ln or "Member",
+                                phone_number=primary_phone,
+                                date_of_birth=dob,
+                            ),
+                            practice_id=practice_id,
+                            allow_shared_household_phone=True,
+                        )
+                        if cp.success and cp.patient:
+                            pid = cp.patient.id
 
         if pid is None:
             unresolved.append(display_name)
             continue
+
+        if not (rel == "self" or rel in ("me", "myself", "i")):
+            ensure_patients_in_same_family_group(
+                db,
+                practice_id,
+                state.patient_id,
+                pid,
+                member_role_hint=m.get("relation"),
+            )
 
         booking_members.append(
             FamilyBookingMemberIn(
@@ -1515,7 +1598,7 @@ def _dispatch_family_booking(
             "I need at least two people with chart IDs I can book into before I can reserve slots together. "
             "I've sent your family details to our team — someone will call to finish setting everyone up."
         )
-        new_state = workflow_state_after_completed_flow(state)
+        new_state = workflow_state_terminal_reply(state)
         return reply, new_state, ["create_staff_notification"]
 
     payload = BookFamilyAppointmentsInput(
@@ -1543,7 +1626,7 @@ def _dispatch_family_booking(
                 f"All set — here's one appointment per person:\n\n{appt_lines}\n\n"
                 "You'll get a confirmation for each. See you all soon!"
             )
-            new_state = workflow_state_after_completed_flow(state)
+            new_state = workflow_state_terminal_reply(state)
             return reply, new_state, tools_called
 
         booked_count = len(result.appointments)
@@ -1580,7 +1663,7 @@ def _dispatch_family_booking(
                 "Our team will follow up."
             )
 
-        new_state = workflow_state_after_completed_flow(state)
+        new_state = workflow_state_terminal_reply(state)
         return reply, new_state, tools_called
 
     # First step: find slots and show exact times — book only after a second yes.
@@ -1631,5 +1714,5 @@ def _dispatch_family_booking(
         "I couldn't find grouped slots that work for everyone in that window. "
         "I've flagged our team — they'll call to coordinate times."
     )
-    new_state = workflow_state_after_completed_flow(state)
+    new_state = workflow_state_terminal_reply(state)
     return reply, new_state, tools_called

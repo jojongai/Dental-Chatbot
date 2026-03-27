@@ -41,6 +41,60 @@ from schemas.employee import (
 
 TZ = ZoneInfo("America/Toronto")
 
+
+def _release_stale_appointment_slot_claims(db: Session, slot_id: str) -> None:
+    """
+    appointments.slot_id is UNIQUE. Cancelled/rescheduled rows must not keep a slot_id
+    or that slot can never be booked again (slot row may still be marked available).
+    Heals legacy rows created before cancel/reschedule cleared slot_id.
+    """
+    stmt = select(Appointment).where(
+        Appointment.slot_id == slot_id,
+        Appointment.status.in_(("cancelled", "rescheduled")),
+    )
+    for appt in db.execute(stmt).scalars().all():
+        appt.slot_id = None
+
+
+def normalize_group_preference(raw: str | None) -> str:
+    """
+    Map LLM / UI text to a canonical GroupPreference value.
+    Mis-spellings or phrases like 'back to back' must still enforce consecutive slots.
+    """
+    if raw is None or (isinstance(raw, str) and not str(raw).strip()):
+        return "back_to_back"
+    s = str(raw).strip().lower().replace(" ", "_").replace("-", "_")
+    if s in ("back_to_back", "backtoback", "consecutive", "one_after_another"):
+        return "back_to_back"
+    if s in ("same_day", "sameday"):
+        return "same_day"
+    if s in ("same_provider", "sameprovider", "same_dentist", "same_hygienist"):
+        return "same_provider"
+    if s in ("best_available", "any", "flexible", "whatever_works"):
+        return "best_available"
+    if s in ("back_to_back", "same_day", "same_provider", "best_available"):
+        return s
+    return "back_to_back"
+
+
+# Max seconds after previous appointment ends that the next may start (back-to-back tolerance).
+_BACK_TO_BACK_MAX_GAP_SEC = 300
+
+
+def _active_appointment_holding_slot(db: Session, slot_id: str) -> Appointment | None:
+    """Return a non-terminal appointment row still claiming this slot, if any."""
+    return (
+        db.execute(
+            select(Appointment).where(
+                Appointment.slot_id == slot_id,
+                Appointment.status.notin_(("cancelled", "rescheduled")),
+            )
+        )
+        .scalars()
+        .first()
+    )
+
+
 # Time-of-day hour ranges (hour inclusive start, exclusive end)
 _TIME_RANGES: dict[str, tuple[int, int]] = {
     "morning": (8, 12),
@@ -370,11 +424,15 @@ def reschedule_appointment(db: Session, payload: RescheduleAppointmentInput) -> 
     new_slot = db.get(AppointmentSlot, payload.new_slot_id)
     if not new_slot:
         return RescheduleAppointmentOutput(success=False, error="New slot not found.")
-    if new_slot.slot_status != "available":
+    # Same slot as this appointment is still "booked" until we free it below.
+    same_slot = new_slot.id == old_appt.slot_id
+    if new_slot.slot_status != "available" and not same_slot:
         return RescheduleAppointmentOutput(
             success=False,
             error="Sorry, that slot was just taken. Let me find you another available time.",
         )
+
+    _release_stale_appointment_slot_claims(db, new_slot.id)
 
     # --- free old slot ---
     old_slot = db.get(AppointmentSlot, old_appt.slot_id)
@@ -383,6 +441,9 @@ def reschedule_appointment(db: Session, payload: RescheduleAppointmentInput) -> 
 
     # --- cancel old appointment record ---
     old_appt.status = "rescheduled"
+    # slot_id is UNIQUE across appointments; release it so the new row can claim
+    # new_slot (including when the patient picks the same slot they already had).
+    old_appt.slot_id = None
 
     # --- book new appointment ---
     new_slot.slot_status = "booked"
@@ -439,6 +500,7 @@ def cancel_appointment(db: Session, payload: CancelAppointmentInput) -> CancelAp
         slot.slot_status = "available"
 
     appt.status = "cancelled"
+    appt.slot_id = None
     if payload.cancel_reason:
         appt.special_instructions = (
             f"Cancelled: {payload.cancel_reason}. {appt.special_instructions or ''}"
@@ -512,6 +574,11 @@ def assign_family_appointment_slots(
             seen.add(s.id)
             unique_slots.append(s)
 
+    rp = getattr(payload, "group_preference", None)
+    if rp is not None and hasattr(rp, "value"):
+        rp = rp.value
+    pref = normalize_group_preference(str(rp) if rp is not None else None)
+
     assigned: list[tuple[AppointmentSlot, AppointmentType, FamilyBookingMemberIn]] = []
     used_slot_ids: set[str] = set()
     last_end: _dt | None = None
@@ -526,21 +593,36 @@ def assign_family_appointment_slots(
         if not appt_type:
             continue
 
-        for slot in unique_slots:
-            if slot.id in used_slot_ids:
-                continue
-            if slot.appointment_type_id != appt_type.id:
-                continue
+        candidates = [
+            s
+            for s in unique_slots
+            if s.id not in used_slot_ids and s.appointment_type_id == appt_type.id
+        ]
+        candidates.sort(key=lambda s: s.starts_at)
 
-            if payload.group_preference == "back_to_back" and last_end is not None:
-                gap = (slot.starts_at - last_end).total_seconds()
-                if not (0 <= gap <= 60):
+        chosen: AppointmentSlot | None = None
+        if last_end is None:
+            chosen = candidates[0] if candidates else None
+        elif pref == "back_to_back":
+            for s in candidates:
+                gap_sec = (s.starts_at - last_end).total_seconds()
+                if gap_sec < -1:
                     continue
+                if 0 <= gap_sec <= _BACK_TO_BACK_MAX_GAP_SEC:
+                    chosen = s
+                    break
+        elif pref in ("same_day", "best_available", "same_provider"):
+            sequential = [s for s in candidates if s.starts_at >= last_end]
+            chosen = sequential[0] if sequential else (candidates[0] if candidates else None)
+        else:
+            chosen = candidates[0] if candidates else None
 
-            assigned.append((slot, appt_type, member))
-            used_slot_ids.add(slot.id)
-            last_end = slot.ends_at
+        if chosen is None:
             break
+
+        assigned.append((chosen, appt_type, member))
+        used_slot_ids.add(chosen.id)
+        last_end = chosen.ends_at
 
     return assigned, appt_type_cache
 
@@ -554,9 +636,17 @@ def _finalize_family_bookings(
     booked_appointments: list[AppointmentOut] = []
     partial_failures: list[str] = []
 
+    consumed_slot_ids: set[str] = set()
     for slot, appt_type, member in assigned:
+        if slot.id in consumed_slot_ids:
+            partial_failures.append(member.patient_id)
+            continue
+        _release_stale_appointment_slot_claims(db, slot.id)
         fresh = db.get(AppointmentSlot, slot.id)
         if not fresh or fresh.slot_status != "available":
+            partial_failures.append(member.patient_id)
+            continue
+        if _active_appointment_holding_slot(db, fresh.id) is not None:
             partial_failures.append(member.patient_id)
             continue
 
@@ -577,7 +667,12 @@ def _finalize_family_bookings(
         )
         db.add(appointment)
         db.flush()
-        booked_appointments.append(_appt_to_out(appointment, db))
+        consumed_slot_ids.add(fresh.id)
+        out = _appt_to_out(appointment, db)
+        dn = (member.display_name or "").strip()
+        if dn:
+            out = out.model_copy(update={"patient_name": dn})
+        booked_appointments.append(out)
 
     assigned_patient_ids = {m.patient_id for _, _, m in assigned}
     for member in payload.members:
@@ -602,6 +697,14 @@ def book_family_appointments_from_proposed_slots(
     Re-checks availability before committing.
     """
     if len(slot_ids) != len(payload.members):
+        return BookFamilyAppointmentsOutput(
+            appointments=[],
+            group_preference=payload.group_preference,
+            all_booked=False,
+            partial_failures=[m.patient_id for m in payload.members],
+        )
+
+    if len(slot_ids) != len(set(slot_ids)):
         return BookFamilyAppointmentsOutput(
             appointments=[],
             group_preference=payload.group_preference,

@@ -330,6 +330,10 @@ class TestCancelAppointment:
         assert slot is not None
         assert slot.slot_status == "available"
 
+        appt = db.get(Appointment, "appt1")
+        assert appt is not None
+        assert appt.slot_id is None
+
     def test_cancel_reason_stored(self, db: Session) -> None:
         cancel_appointment(
             db, CancelAppointmentInput(appointment_id="appt1", cancel_reason="Moved out of town")
@@ -389,6 +393,33 @@ class TestRescheduleAppointment:
         new_appt = db.get(Appointment, result.new_appointment.id)  # type: ignore[union-attr]
         assert new_appt is not None
         assert new_appt.rescheduled_from_appointment_id == "appt1"
+
+    def test_reschedule_to_same_slot_succeeds(self, db: Session) -> None:
+        """UNIQUE(appointments.slot_id): old row must release slot_id before new row inserts."""
+        result = reschedule_appointment(
+            db, RescheduleAppointmentInput(appointment_id="appt1", new_slot_id="slot_appt1")
+        )
+        assert result.success and result.new_appointment is not None
+        old = db.get(Appointment, "appt1")
+        assert old is not None
+        assert old.slot_id is None
+        assert old.status == "rescheduled"
+        new = db.get(Appointment, result.new_appointment.id)  # type: ignore[union-attr]
+        assert new is not None
+        assert new.slot_id == "slot_appt1"
+
+    def test_reschedule_clears_legacy_cancelled_slot_claim(self, db: Session) -> None:
+        """Pre-fix cancelled rows could still hold slot_id; reschedule must not UNIQUE-fail."""
+        legacy = db.get(Appointment, "appt_cancelled")
+        assert legacy is not None
+        legacy.slot_id = "slot2"
+        db.commit()
+
+        result = reschedule_appointment(
+            db, RescheduleAppointmentInput(appointment_id="appt1", new_slot_id="slot2")
+        )
+        assert result.success
+        assert result.new_appointment is not None
 
     def test_appointment_not_found(self, db: Session) -> None:
         result = reschedule_appointment(
@@ -510,6 +541,35 @@ class TestKnownPatientListInjection:
         result = MachineResult(state=state, reply="x", next_field="preferred_date_from")
         assert _list_appointments_if_known_patient_skipped_verification(result, db) is None
 
+    def test_awaiting_confirmation_without_appointment_still_gets_list(self, db: Session) -> None:
+        """Bogus confirmation (e.g. bad name extract) must be replaced by appointment list."""
+        from state_machine.machine import MachineResult
+
+        from routers.chat import _list_appointments_if_known_patient_skipped_verification
+
+        state = WorkflowState(
+            workflow=Workflow.CANCEL_APPOINTMENT,
+            step="awaiting_confirmation",
+            patient_id="pat1",
+            collected_fields={
+                "first_name": "The",
+                "last_name": "Following Friday",
+                "cancel_reason": "Patient request",
+            },
+        )
+        result = MachineResult(
+            state=state,
+            reply="Does everything look correct?",
+            next_field="confirmation",
+            ready_to_call=False,
+        )
+        out = _list_appointments_if_known_patient_skipped_verification(result, db)
+        assert out is not None
+        _, new_state, _ = out
+        assert new_state.step == "selecting_appointment"
+        assert "cancel_reason" not in (new_state.collected_fields or {})
+        assert new_state.appointment_options
+
 
 class TestCancelFlow:
     def test_no_appointments_returns_graceful_message(self, db: Session) -> None:
@@ -524,7 +584,7 @@ class TestCancelFlow:
         reply, new_state = _list_and_present_appointments(state, db, "Bob")
         assert "nothing to cancel" in reply.lower() or "don't see any" in reply.lower()
         assert new_state.workflow == Workflow.GENERAL_INQUIRY
-        assert new_state.step == "start"
+        assert new_state.step == "done"
 
     def test_list_presents_numbered_appointments(self, db: Session) -> None:
         """Patient with two upcoming appointments sees a numbered list."""
@@ -616,7 +676,7 @@ class TestCancelFlow:
         assert "cancel" in reply.lower() or "done" in reply.lower()
         assert "cancel_appointment" in tools
         assert new_state.workflow == Workflow.GENERAL_INQUIRY
-        assert new_state.step == "start"
+        assert new_state.step == "done"
         assert new_state.appointment_id is None
         assert "cancel_reason" not in new_state.collected_fields
 
@@ -724,7 +784,7 @@ class TestRescheduleFlow:
         reply = response.reply.lower()
         assert "reschedule" in reply or "rescheduled" in reply or "new" in reply
         assert response.state.workflow == Workflow.GENERAL_INQUIRY
-        assert response.state.step == "start"
+        assert response.state.step == "done"
         assert response.state.slot_options == []
 
     def test_reschedule_slot_taken_shows_remaining(self, db: Session) -> None:

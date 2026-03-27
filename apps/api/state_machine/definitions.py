@@ -290,7 +290,6 @@ WORKFLOWS: dict[Workflow, WorkflowDef] = {
             "date_of_birth",
             "insurance_name",  # optional but explicitly asked
             "appointment_type",
-            "preferred_date_from",
         ],
         optional_fields=["preferred_time_of_day"],
         tool_name="create_patient",
@@ -365,7 +364,8 @@ WORKFLOWS: dict[Workflow, WorkflowDef] = {
         optional_fields=[],
         tool_name="book_family_appointments",
         requires_patient_id=True,
-        requires_confirmation=True,
+        # Confirmation is handled inside family_booking.py (members, then slot list).
+        requires_confirmation=False,
         greeting="Love it — I can get everyone booked.",
         ready_message="Here's what I have for your family booking:",
     ),

@@ -8,6 +8,7 @@ from schemas.chat import (
     Workflow,
     WorkflowState,
     workflow_state_after_completed_flow,
+    workflow_state_terminal_reply,
 )
 
 
@@ -50,3 +51,16 @@ def test_workflow_state_after_completed_flow_keeps_identity_only() -> None:
 def test_thread_terminal_steps_includes_confirmed_and_done() -> None:
     assert "confirmed" in THREAD_TERMINAL_STEPS
     assert "done" in THREAD_TERMINAL_STEPS
+
+
+def test_workflow_state_terminal_reply_signals_client_echo_with_done() -> None:
+    s = WorkflowState(
+        workflow=Workflow.CANCEL_APPOINTMENT,
+        step="awaiting_confirmation",
+        patient_id="pat-1",
+        collected_fields={"cancel_reason": "test", "first_name": "Jo"},
+    )
+    out = workflow_state_terminal_reply(s)
+    assert out.step == "done"
+    assert out.workflow == Workflow.GENERAL_INQUIRY
+    assert "cancel_reason" not in out.collected_fields

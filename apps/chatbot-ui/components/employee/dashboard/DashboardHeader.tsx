@@ -5,20 +5,25 @@ import { useEffect, useRef, useState } from "react";
 import type { EmployeeEmergencyRow } from "@/data/employee-appointments";
 import { cn } from "@/lib/utils";
 
-const today = new Date();
-const formattedDate = today.toLocaleDateString("en-US", {
-  weekday: "long",
-  year: "numeric",
-  month: "long",
-  day: "numeric",
-});
-
 interface DashboardHeaderProps {
   emergencies: EmployeeEmergencyRow[];
 }
 
 const DashboardHeader = ({ emergencies }: DashboardHeaderProps) => {
+  /** Set after mount so SSR and first client paint match (avoids server TZ vs browser TZ hydration mismatch). */
+  const [formattedDate, setFormattedDate] = useState("");
   const [open, setOpen] = useState(false);
+
+  useEffect(() => {
+    setFormattedDate(
+      new Date().toLocaleDateString("en-US", {
+        weekday: "long",
+        year: "numeric",
+        month: "long",
+        day: "numeric",
+      }),
+    );
+  }, []);
   const containerRef = useRef<HTMLDivElement>(null);
   const emergencyCount = emergencies.length;
 
@@ -62,9 +67,9 @@ const DashboardHeader = ({ emergencies }: DashboardHeaderProps) => {
         </div>
       </div>
 
-      <div className="hidden items-center gap-2 text-muted-foreground sm:flex">
+      <div className="hidden min-h-[1.25rem] items-center gap-2 text-muted-foreground sm:flex">
         <CalendarDays className="h-4 w-4" />
-        <span className="text-sm font-medium">{formattedDate}</span>
+        <span className="text-sm font-medium">{formattedDate || "\u00a0"}</span>
       </div>
 
       <div className="flex items-center gap-3">

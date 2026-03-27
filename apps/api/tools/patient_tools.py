@@ -84,8 +84,15 @@ def lookup_patient(db: Session, payload: LookupPatientInput, practice_id: str = 
     if phone_norm:
         matches = [p for p in patients if normalize_phone_digits(p.phone_number) == phone_norm]
         if len(matches) == 1:
-            return LookupPatientOutput(found=True, patient=_patient_to_out(matches[0]), match_confidence=0.8)
-        if len(matches) > 1:
+            p = matches[0]
+            # Phone-only / caller-ID: one chart on this number — attribute it.
+            if not fn or not ln:
+                return LookupPatientOutput(found=True, patient=_patient_to_out(p), match_confidence=0.8)
+            # Name was given but Strategy 1 found no phone+name row. If the only chart on this
+            # number is someone else, do not return them — try Strategy 3 (name-only) for a
+            # family member whose chart uses a different phone.
+            # (If fn/ln matched this record, Strategy 1 would already have returned.)
+        elif len(matches) > 1:
             # Try to narrow with name if available
             if fn and ln:
                 narrowed = [p for p in matches if p.first_name.strip().lower() == fn and p.last_name.strip().lower() == ln]
@@ -121,13 +128,16 @@ def create_patient(
     db: Session,
     payload: CreatePatientInput,
     practice_id: str,
+    *,
+    allow_shared_household_phone: bool = False,
 ) -> CreatePatientOutput:
     """
     Create a new Patient row (status='lead') and optionally link an InsurancePlan
     if insurance_name matches a known carrier in the DB.
 
     Validates:
-    - No duplicate by normalized phone
+    - No duplicate by normalized phone (unless allow_shared_household_phone — family booking
+      adds a dependent on the verified primary's number)
     - Valid date_of_birth (past, realistic)
     - Phone normalizes to 10 digits
     """
@@ -143,19 +153,20 @@ def create_patient(
         return CreatePatientOutput(success=False, error=str(exc))
 
     # --- duplicate check ---
-    existing = db.execute(
-        select(Patient).where(Patient.practice_id == practice_id).limit(500)
-    ).scalars().all()
+    if not allow_shared_household_phone:
+        existing = db.execute(
+            select(Patient).where(Patient.practice_id == practice_id).limit(500)
+        ).scalars().all()
 
-    for p in existing:
-        if normalize_phone_digits(p.phone_number) == norm_phone:
-            return CreatePatientOutput(
-                success=False,
-                error=(
-                    f"A patient with that phone number already exists "
-                    f"({p.first_name} {p.last_name}). Are you an existing patient?"
-                ),
-            )
+        for p in existing:
+            if normalize_phone_digits(p.phone_number) == norm_phone:
+                return CreatePatientOutput(
+                    success=False,
+                    error=(
+                        f"A patient with that phone number already exists "
+                        f"({p.first_name} {p.last_name}). Are you an existing patient?"
+                    ),
+                )
 
     # --- create patient ---
     patient = Patient(

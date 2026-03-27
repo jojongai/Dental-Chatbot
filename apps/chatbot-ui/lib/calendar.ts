@@ -23,7 +23,7 @@ export function formatScheduleHeading(iso: string): string {
   if (!iso) return "Schedule";
   const [y, m, d] = iso.split("-").map(Number);
   const dt = new Date(y, m - 1, d);
-  return dt.toLocaleDateString(undefined, {
+  return dt.toLocaleDateString("en-US", {
     weekday: "long",
     month: "long",
     day: "numeric",
@@ -43,5 +43,5 @@ export function formatWeekRangeLabel(weekDays: WeekDayCountRow[]): string {
   if (y1 !== y2) {
     opts.year = "numeric";
   }
-  return `${a.toLocaleDateString(undefined, opts)} – ${b.toLocaleDateString(undefined, { ...opts, year: "numeric" })}`;
+  return `${a.toLocaleDateString("en-US", opts)} – ${b.toLocaleDateString("en-US", { ...opts, year: "numeric" })}`;
 }

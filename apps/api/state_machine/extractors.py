@@ -42,6 +42,8 @@ _NAME_LEAD_PATTERNS = [
     # "i go by" is a deliberate name introduction; "patient" / "calling" removed —
     # they matched intent phrases like "new patient looking to book"
     r"(?:i go by)\s+([A-Za-z][a-zA-Z\-']+(?:\s+[A-Za-z][a-zA-Z\-']+)+)",
+    # Corrections during confirmation (e.g. cancel summary)
+    r"(?:name\s+should\s+be|correct\s+(?:the\s+)?name\s*(?:to|is)|change\s+(?:the\s+)?name\s+to)\s+([A-Za-z][a-zA-Z\-']+(?:\s+[A-Za-z][a-zA-Z\-']+)+)",
 ]
 
 # Two-word phrases like "cancel appointment" / "new patient" match the bare-name fallback
@@ -51,6 +53,8 @@ _NAME_FALSE_POSITIVE_WORDS = frozenset({
     "booking", "book", "booked", "cancelled", "canceled", "schedule", "scheduling",
     "new", "patient", "patients", "existing", "dentist", "dental", "teeth", "cleaning",
     "checkup", "check-up", "visit", "family", "emergency", "urgent",
+    # Relative scheduling phrases (not "First Last" names), e.g. "next week", "this month"
+    "next", "this", "week", "month", "tomorrow", "today",
 })
 
 
@@ -60,7 +64,19 @@ def is_false_positive_name_pair(first_name: str | None, last_name: str | None) -
         return False
     f = first_name.strip().lower()
     l = last_name.strip().lower()
-    return f in _NAME_FALSE_POSITIVE_WORDS and l in _NAME_FALSE_POSITIVE_WORDS
+    if f in _NAME_FALSE_POSITIVE_WORDS and l in _NAME_FALSE_POSITIVE_WORDS:
+        return True
+    # LLM often splits "scheduling issue" / "schedule conflict" into first+last name.
+    if f in _NAME_FALSE_POSITIVE_WORDS and l in (
+        "issue",
+        "issues",
+        "problem",
+        "problems",
+        "conflict",
+        "reason",
+    ):
+        return True
+    return False
 
 
 def merge_extracted_name_into_collected(
@@ -109,6 +125,25 @@ def extract_full_name(text: str) -> dict[str, str] | None:
 
     # Fallback: message is entirely a name-like string (≤4 words, all title-case-ish)
     words = text.strip().split()
+    joined_lower = " ".join(words).lower()
+    # "The following Friday", "the following week" — scheduling, not a person's name
+    if "the following" in joined_lower or (
+        "following" in joined_lower
+        and any(
+            d in joined_lower
+            for d in (
+                "monday",
+                "tuesday",
+                "wednesday",
+                "thursday",
+                "friday",
+                "saturday",
+                "sunday",
+                "week",
+            )
+        )
+    ):
+        return None
     if 2 <= len(words) <= 4 and all(re.match(r"^[A-Za-z\-']{2,}$", w) for w in words):
         fn = _title(words[0])
         ln = _title(" ".join(words[1:]))

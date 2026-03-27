@@ -185,6 +185,20 @@ def _seed(db: Session) -> None:
         )
     )
 
+    # Same practice, different phone — used for household-phone + different-name fallthrough.
+    db.add(
+        Patient(
+            id="pat_josh",
+            practice_id=practice.id,
+            first_name="Josh",
+            last_name="Ngai",
+            phone_number="4165550999",
+            date_of_birth=date(2005, 1, 1),
+            email="josh@example.com",
+            status="active",
+        )
+    )
+
     db.commit()
 
 
@@ -248,6 +262,28 @@ class TestLookupPrimaryKey:
         assert result.found is False
         # The phone matched records; system cannot verify Bob — caller should provide email.
         assert result.multiple_matches is True
+
+    def test_wrong_name_unique_phone_not_found(self, db: Session) -> None:
+        """One patient on that phone — wrong name must not return that patient."""
+        result = lookup_patient(
+            db,
+            LookupPatientInput(first_name="Wrong", last_name="Name", phone_number="(416) 555-0203"),
+            practice_id=PRACTICE_ID,
+        )
+        assert result.found is False
+        assert result.multiple_matches is False
+
+    def test_household_phone_wrong_name_falls_through_to_name_only_match(self, db: Session) -> None:
+        """Phone matches Carol only, but Josh exists — resolve Josh by name (0.7), not Carol's chart."""
+        result = lookup_patient(
+            db,
+            LookupPatientInput(first_name="Josh", last_name="Ngai", phone_number="(416) 555-0203"),
+            practice_id=PRACTICE_ID,
+        )
+        assert result.found is True
+        assert result.patient is not None
+        assert result.patient.id == "pat_josh"
+        assert result.match_confidence == 0.7
 
     def test_wrong_phone_falls_back_to_name_match(self, db: Session) -> None:
         """
