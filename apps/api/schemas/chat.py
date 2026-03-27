@@ -69,23 +69,61 @@ IDENTITY_FIELD_KEYS: frozenset[str] = frozenset({
     "date_of_birth",
     "email",
     "insurance_name",
+    # Optional trusted label from chart / lookup (never inferred booking intent)
+    "patient_status",
 })
 
+# Machine / router steps that mean "the last workflow finished; next message is a new request."
+THREAD_TERMINAL_STEPS: frozenset[str] = frozenset({"confirmed", "done"})
 
-def workflow_state_for_new_conversation(state: WorkflowState | None) -> WorkflowState:
+# Appended to terminal completion replies so the thread closes clearly before state reset.
+# (No signature here — Maya signs only on interactive closings; see gratitude reply in chat router.)
+MAYA_THREAD_CLOSURE_SIGNOFF = "If you need anything else, just let me know."
+
+
+def workflow_state_after_completed_flow(state: WorkflowState | None) -> WorkflowState:
     """
-    Start a fresh conversation: drop prior-thread intent (why they messaged, dates,
-    appointment types, emergencies, pending sub-workflows) while optionally keeping
-    verified identity and patient_id for demographic pre-fill only.
+    After a workflow completes (or when starting a brand-new conversation thread):
+    keep verified identity + patient linkage; drop all workflow-specific fields and
+    UI/booking state so the next inbound message is routed as a fresh intent.
+
+    Preserved (when present on ``state``):
+        patient_id, conversation_id, and keys in IDENTITY_FIELD_KEYS inside collected_fields.
+
+    Cleared:
+        workflow (reset to GENERAL_INQUIRY), step (start), missing_fields,
+        appointment_id, appointment_request_id, family_group_id,
+        last_clinic_category, slot_options, selected_slot_id, appointment_options,
+        and any collected_fields not in IDENTITY_FIELD_KEYS (appointment_type, dates,
+        cancel_reason, emergency_summary, family booking keys, _pending_workflow, etc.).
     """
     if state is None:
         return WorkflowState()
     old_cf = state.collected_fields or {}
     identity = {k: v for k, v in old_cf.items() if k in IDENTITY_FIELD_KEYS}
     return WorkflowState(
-        patient_id=state.patient_id,
+        workflow=Workflow.GENERAL_INQUIRY,
+        step="start",
         collected_fields=identity,
+        missing_fields=[],
+        patient_id=state.patient_id,
+        conversation_id=state.conversation_id,
+        appointment_id=None,
+        appointment_request_id=None,
+        family_group_id=None,
+        last_clinic_category=None,
+        slot_options=[],
+        selected_slot_id=None,
+        appointment_options=[],
     )
+
+
+def workflow_state_for_new_conversation(state: WorkflowState | None) -> WorkflowState:
+    """
+    Same as ``workflow_state_after_completed_flow`` — client flag ``new_conversation``
+    and server-side terminal completion both use one carry-forward policy.
+    """
+    return workflow_state_after_completed_flow(state)
 
 
 class WorkflowState(BaseModel):

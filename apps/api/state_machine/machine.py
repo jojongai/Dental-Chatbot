@@ -54,10 +54,9 @@ _DETERMINISTIC_FIELDS = frozenset({"phone_number", "date_of_birth", "email"})
 
 # Workflows that need the "Are you a new or existing patient?" question
 # before pivoting to verification or new-patient registration.
+# Cancel / reschedule skip this — they require an existing chart; go straight to verification.
 _PATIENT_TYPE_GATED = frozenset({
     Workflow.BOOK_APPOINTMENT,
-    Workflow.RESCHEDULE_APPOINTMENT,
-    Workflow.CANCEL_APPOINTMENT,
     Workflow.FAMILY_BOOKING,
 })
 
@@ -456,19 +455,26 @@ class WorkflowStateMachine:
 
         collected = dict(self.state.collected_fields)
 
+        from state_machine.extractors import (
+            extract_full_name,
+            is_false_positive_name_pair,
+            merge_extracted_name_into_collected,
+        )
+
         # Merge fields from interpreter (semantic fields)
         for k, v in interp.extracted_fields.items():
             if v is None:
                 continue
             fd = FIELDS.get(k)
             if fd and fd.multi_key and isinstance(v, dict):
-                # Multi-key field (e.g. first_name → {first_name, last_name}).
-                # Merge individual sub-keys that are still missing so that
-                # providing last_name still works when first_name is already set.
-                for sub_k, sub_v in v.items():
-                    if sub_k not in collected and sub_v is not None:
-                        collected[sub_k] = sub_v
-                        logger.debug("Interpreter extracted %r = %r (multi_key)", sub_k, sub_v)
+                if k == "first_name":
+                    merge_extracted_name_into_collected(collected, v)
+                    logger.debug("Interpreter extracted first_name multi_key → %r", v)
+                else:
+                    for sub_k, sub_v in v.items():
+                        if sub_k not in collected and sub_v is not None:
+                            collected[sub_k] = sub_v
+                            logger.debug("Interpreter extracted %r = %r (multi_key)", sub_k, sub_v)
             elif k not in collected:
                 collected[k] = v
                 logger.debug("Interpreter extracted %r = %r", k, v)
@@ -495,20 +501,11 @@ class WorkflowStateMachine:
             if parsed is not None:
                 collected["preferred_date_from"] = parsed
 
-        # Always attempt name extraction via deterministic regex (useful when
-        # the user provides name + phone in the same message, or when
-        # first_name is set but last_name is still missing).
-        if "first_name" not in collected or "last_name" not in collected:
-            fd = FIELDS.get("first_name")
-            if fd and fd.extractor:
-                try:
-                    val = fd.extractor(message)  # type: ignore[call-arg]
-                    if val is not None and isinstance(val, dict):
-                        for sub_k, sub_v in val.items():
-                            if sub_k not in collected and sub_v is not None:
-                                collected[sub_k] = sub_v
-                except Exception:
-                    pass
+        # Deterministic full name (overwrites bogus pairs like Cancel/Appointment from intent text).
+        merge_extracted_name_into_collected(collected, extract_full_name(message))
+        if is_false_positive_name_pair(collected.get("first_name"), collected.get("last_name")):
+            collected.pop("first_name", None)
+            collected.pop("last_name", None)
 
         return self.state.model_copy(update={"collected_fields": collected}), interp
 
@@ -600,7 +597,10 @@ class WorkflowStateMachine:
         )
 
     def _ask_confirmation(self, wf_def: WorkflowDef) -> MachineResult:
-        summary = self._build_summary()
+        if wf_def.workflow == Workflow.CANCEL_APPOINTMENT:
+            summary = self._build_cancel_confirmation_summary()
+        else:
+            summary = self._build_summary()
         reply = f"{wf_def.ready_message}\n\n{summary}\n\nDoes everything look correct?"
         return MachineResult(
             state=self.state.model_copy(update={"step": "awaiting_confirmation"}),
@@ -705,6 +705,37 @@ class WorkflowStateMachine:
         _fmt("group_preference", "Scheduling preference")
 
         return "\n".join(lines) if lines else "(no details collected yet)"
+
+    def _build_cancel_confirmation_summary(self) -> str:
+        """Cancel flow: show patient name + selected appointment date/time + reason (no phone)."""
+        from state_machine.extractors import is_false_positive_name_pair
+
+        cf = self.state.collected_fields
+        fn = (cf.get("first_name") or "").strip()
+        ln = (cf.get("last_name") or "").strip()
+        if is_false_positive_name_pair(fn, ln):
+            fn, ln = "", ""
+        name = f"{fn} {ln}".strip() or "—"
+        date_l = (cf.get("_cancel_appointment_date_label") or "").strip() or "—"
+        time_l = (cf.get("_cancel_appointment_time_label") or "").strip() or "—"
+        reason = cf.get("cancel_reason")
+        if isinstance(reason, date):
+            reason_str = reason.strftime("%B %d, %Y")
+        else:
+            reason_str = str(reason).strip() if reason is not None else "—"
+        line = (cf.get("_cancel_appointment_line") or "").strip()
+        if date_l == "—" and time_l == "—" and line:
+            return (
+                f"• **Name**: {name}\n"
+                f"• **Appointment**: {line}\n"
+                f"• **Reason**: {reason_str}"
+            )
+        return (
+            f"• **Name**: {name}\n"
+            f"• **Date**: {date_l}\n"
+            f"• **Time**: {time_l}\n"
+            f"• **Reason**: {reason_str}"
+        )
 
     def _build_family_booking_summary(self) -> str:
         from state_machine.family_booking import family_booking_summary_markdown

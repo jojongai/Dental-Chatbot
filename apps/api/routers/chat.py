@@ -14,26 +14,146 @@ Flow per turn
 
 from __future__ import annotations
 
+import re
+
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from database import get_db
 from schemas.chat import (
+    IDENTITY_FIELD_KEYS,
+    MAYA_THREAD_CLOSURE_SIGNOFF,
+    THREAD_TERMINAL_STEPS,
     ChatRequest,
     ChatResponse,
     Workflow,
     WorkflowState,
+    workflow_state_after_completed_flow,
     workflow_state_for_new_conversation,
 )
-from state_machine.machine import WorkflowStateMachine, machine_status
+from state_machine.machine import MachineResult, WorkflowStateMachine, machine_status
 
 router = APIRouter(prefix="/chat", tags=["chat"])
+
+# Short thanks / goodbye after a completed task — includes signature (interactive closing).
+GRATITUDE_IDLE_REPLY = "No worries — have a good one! - Maya"
+
+_GRATITUDE_CLOSING = re.compile(
+    r"\b("
+    r"thanks?|thank\s+you|thx|tysm|ty|cheers|appreciate|grateful|"
+    r"nothing\s+else|that'?s\s+all|all\s+set|no\s+more|"
+    r"perfect|awesome|great\s+thanks"
+    r")\b",
+    re.IGNORECASE,
+)
+# If present, user is probably starting a new request — don't treat as thanks-only.
+_GRATITUDE_BLOCK_INTENT = re.compile(
+    r"\b("
+    r"book|cancel|reschedule|appointment|rebook|hours|open|location|address|"
+    r"insurance|pain|emergency|tooth|teeth|cleaning|check|family|register|"
+    r"price|cost|fee|how\s+much|when\s+can|slot"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _append_maya_thread_signoff(reply: str) -> str:
+    """Closing line for completed flows; idempotent if the sign-off is already present."""
+    r = (reply or "").strip()
+    if not r:
+        return MAYA_THREAD_CLOSURE_SIGNOFF
+    low = r.lower()
+    if "if you need anything else" in low:
+        return r
+    return f"{r}\n\n{MAYA_THREAD_CLOSURE_SIGNOFF}"
+
+
+def _is_idle_for_gratitude_reply(state: WorkflowState) -> bool:
+    """True when we're not mid-booking / mid-verification (short thanks is plausible)."""
+    if state.workflow != Workflow.GENERAL_INQUIRY:
+        return False
+    if state.slot_options or state.appointment_options:
+        return False
+    s = state.step
+    if s in (
+        "selecting_slot",
+        "selecting_appointment",
+        "no_slots_retry",
+        "disambiguating",
+        "awaiting_confirmation",
+        "awaiting_family_slot_confirmation",
+        "verify_identity",
+        "awaiting_patient_type",
+    ):
+        return False
+    if s.startswith("collecting") or s.startswith("family:"):
+        return False
+    return True
+
+
+def _has_prior_identity_or_patient(state: WorkflowState) -> bool:
+    if state.patient_id:
+        return True
+    cf = state.collected_fields or {}
+    return any(
+        k in IDENTITY_FIELD_KEYS and cf.get(k) not in (None, "")
+        for k in cf
+    )
+
+
+def _looks_like_gratitude_only_closure(message: str) -> bool:
+    t = (message or "").strip()
+    if len(t) > 200 or len(t) < 2:
+        return False
+    if _GRATITUDE_BLOCK_INTENT.search(t):
+        return False
+    return bool(_GRATITUDE_CLOSING.search(t))
 
 # First outbound SMS after a missed call (prototype — static copy only, no DB / lookup).
 OPENING_SMS_TEXT = (
     "So sorry we missed your call! This is Maya from Bright Smile Dental. "
     "How can I help you today?"
 )
+
+
+def _first_name_from_patient_db(db: Session, patient_id: str) -> str | None:
+    from models.patient import Patient
+
+    p = db.get(Patient, patient_id)
+    return (p.first_name or None) if p else None
+
+
+def _list_appointments_if_known_patient_skipped_verification(
+    result: MachineResult,
+    db: Session,
+) -> tuple[str, WorkflowState, list[str]] | None:
+    """
+    After lookup, cancel/reschedule always list appointments before intake.
+
+    If the patient **already** has ``patient_id`` (e.g. post–terminal reset),
+    the machine used to jump straight to ``preferred_date_from`` (reschedule) or
+    ``cancel_reason`` (cancel) without picking an appointment. Same fix for both:
+    replace that turn with the numbered appointment list + ``_pending_workflow``.
+    """
+    s = result.state
+    if not s.patient_id or s.appointment_id:
+        return None
+    if s.workflow not in (Workflow.RESCHEDULE_APPOINTMENT, Workflow.CANCEL_APPOINTMENT):
+        return None
+    if s.step == "selecting_appointment" and s.appointment_options:
+        return None
+    if result.next_field not in ("preferred_date_from", "cancel_reason"):
+        return None
+    if result.ready_to_call:
+        return None
+
+    cf = {**s.collected_fields, "_pending_workflow": s.workflow.value}
+    list_state = s.model_copy(update={"collected_fields": cf, "missing_fields": []})
+    fn = (list_state.collected_fields.get("first_name") or "").strip() or None
+    if not fn:
+        fn = _first_name_from_patient_db(db, s.patient_id) or "there"
+    reply, new_state = _list_and_present_appointments(list_state, db, fn)
+    return reply, new_state, ["list_patient_appointments"]
 
 
 def _is_first_substantive_turn(state: WorkflowState) -> bool:
@@ -86,6 +206,22 @@ async def post_chat(
     current_state = body.state or WorkflowState()
     if body.new_conversation:
         current_state = workflow_state_for_new_conversation(body.state)
+    elif current_state.step in THREAD_TERMINAL_STEPS:
+        # Prior turn completed a workflow; treat this message as a new request thread
+        # (identity + patient_id only — same as new_conversation).
+        current_state = workflow_state_after_completed_flow(current_state)
+
+    # Thanks / goodbye — only after we've had some interaction (identity or chart id).
+    if (
+        _is_idle_for_gratitude_reply(current_state)
+        and _has_prior_identity_or_patient(current_state)
+        and _looks_like_gratitude_only_closure(body.message)
+    ):
+        return ChatResponse(
+            reply=GRATITUDE_IDLE_REPLY,
+            state=current_state,
+            tools_called=[],
+        )
 
     # First "real" user turn for receptionist copy: after opening, state is often
     # empty GENERAL_INQUIRY/start — still the patient's first substantive message.
@@ -114,8 +250,10 @@ async def post_chat(
     updated_state = result.state
     tools_called: list[str] = []
 
-    # --- attempt tool call if machine says it's ready ---
-    if result.ready_to_call and result.tool_name:
+    listed = _list_appointments_if_known_patient_skipped_verification(result, db)
+    if listed is not None:
+        reply, updated_state, tools_called = listed
+    elif result.ready_to_call and result.tool_name:
         reply, updated_state, tools_called = _dispatch_tool(
             tool_name=result.tool_name,
             tool_input_data=result.tool_input_data,
@@ -126,10 +264,12 @@ async def post_chat(
             practice_id=practice_id,
         )
 
+    response_actions = [] if listed is not None else result.actions
+
     return ChatResponse(
         reply=reply,
         state=updated_state,
-        actions=result.actions,
+        actions=response_actions,
         tools_called=tools_called,
     )
 
@@ -246,6 +386,7 @@ def _dispatch_tool(
                     inquiry_followup=followup,
                     inquiry_category=category,
                 )
+                reply = _append_maya_thread_signoff(reply)
                 new_state = state.model_copy(update={"last_clinic_category": category})
                 return reply, new_state, ["get_clinic_info"]
 
@@ -396,11 +537,11 @@ def _dispatch_tool(
                         ["cancel_appointment"],
                     )
                 a = result.cancelled_appointment
-                reply = (
+                reply = _append_maya_thread_signoff(
                     f"Done — your {a.appointment_type_display} on {a.date_label} at {a.time_label} "
-                    "has been cancelled. If you ever want to rebook, just text us anytime. - Maya"
+                    "has been cancelled."
                 )
-                new_state = state.model_copy(update={"step": "confirmed"})
+                new_state = workflow_state_after_completed_flow(state)
                 return reply, new_state, ["cancel_appointment"]
 
             # ------------------------------------------------------------------
@@ -523,11 +664,11 @@ def _list_and_present_appointments(
     if not result.appointments:
         pending = state.collected_fields.get("_pending_workflow", "")
         action = "reschedule" if pending == "reschedule_appointment" else "cancel"
-        reply = (
+        reply = _append_maya_thread_signoff(
             f"I looked up your file, {first_name}, but I don't see any upcoming appointments. "
-            f"Nothing to {action} right now! Is there anything else I can help you with?"
+            f"Nothing to {action} right now!"
         )
-        new_state = state.model_copy(update={"step": "done"})
+        new_state = workflow_state_after_completed_flow(state)
         return reply, new_state
 
     pending = state.collected_fields.get("_pending_workflow", "")
@@ -537,7 +678,13 @@ def _list_and_present_appointments(
         for i, a in enumerate(result.appointments)
     )
     appt_options = [
-        {"id": a.id, "label": f"{a.appointment_type_display} — {a.date_label}, {a.time_label}"}
+        {
+            "id": a.id,
+            "label": f"{a.appointment_type_display} — {a.date_label}, {a.time_label}",
+            "date_label": a.date_label,
+            "time_label": a.time_label,
+            "appointment_type_display": a.appointment_type_display,
+        }
         for a in result.appointments
     ]
     reply = (
@@ -582,26 +729,47 @@ def _handle_appointment_selection(
 
     pending = state.collected_fields.get("_pending_workflow", "")
 
-    # Store appointment_id and reset to collecting so the machine can gather the
-    # remaining required fields (preferred_date_from for reschedule, cancel_reason for cancel).
+    # After listing, workflow is often still EXISTING_PATIENT_VERIFICATION. If we only
+    # set appointment_id + collecting, verification fields stay "complete" and the machine
+    # fires lookup_patient every turn → _resume_pending_workflow → infinite re-listing.
+    # Switch to the real cancel/reschedule workflow and drop the verification pending flag.
+    base_collected = {
+        k: v
+        for k, v in state.collected_fields.items()
+        if k
+        not in (
+            "preferred_date_from",
+            "preferred_time_of_day",
+            "cancel_reason",
+            "_pending_workflow",
+        )
+    }
+
+    if pending == "reschedule_appointment":
+        target_wf = Workflow.RESCHEDULE_APPOINTMENT
+        missing = ["preferred_date_from"]
+        reply = f"Got it — I'll move your {label}. What dates work better for you?"
+    else:
+        target_wf = Workflow.CANCEL_APPOINTMENT
+        missing = ["cancel_reason"]
+        base_collected["_cancel_appointment_date_label"] = chosen.get("date_label") or ""
+        base_collected["_cancel_appointment_time_label"] = chosen.get("time_label") or ""
+        base_collected["_cancel_appointment_line"] = label
+        reply = (
+            f"Got it — I'll cancel your {label}. Mind sharing the reason? "
+            "(totally fine if it's just scheduling)"
+        )
+
     new_state = state.model_copy(
         update={
+            "workflow": target_wf,
             "appointment_id": appointment_id,
             "step": "collecting",
             "appointment_options": [],
-            # Clear any stale date fields so the machine prompts fresh
-            "collected_fields": {
-                k: v
-                for k, v in state.collected_fields.items()
-                if k not in ("preferred_date_from", "preferred_time_of_day", "cancel_reason")
-            },
+            "collected_fields": base_collected,
+            "missing_fields": missing,
         }
     )
-
-    if pending == "reschedule_appointment":
-        reply = f"Got it — I'll move your {label}. What dates work better for you?"
-    else:
-        reply = f"Got it — I'll cancel your {label}. Mind sharing the reason? (totally fine if it's just scheduling)"
 
     return ChatResponse(reply=reply, state=new_state)
 
@@ -741,19 +909,25 @@ def _handle_slot_selection(
         from state_machine.extractors import extract_preferred_date, extract_time_of_day
 
         new_date = extract_preferred_date(message)
-        if new_date is not None or _is_slot_rejection(message):
+        new_time = extract_time_of_day(message)
+        if new_date is not None or new_time is not None or _is_slot_rejection(message):
             search_data = dict(state.collected_fields)
             if new_date:
                 search_data["preferred_date_from"] = new_date
-            new_time = extract_time_of_day(message)
             if new_time:
                 search_data["preferred_time_of_day"] = new_time
+
+            preamble = "No problem — let me check other times."
+            if new_time and not new_date:
+                preamble = "No problem — let me find something in that time range."
+            elif new_date and not new_time:
+                preamble = ""
 
             reply, new_state, _ = _search_and_present_slots(
                 search_data,
                 state,
                 db,
-                preamble="No problem — let me check other times." if not new_date else "",
+                preamble=preamble,
             )
             return ChatResponse(reply=reply, state=new_state)
 
@@ -833,7 +1007,7 @@ def _handle_slot_selection(
             f"New Date: {a.date_label}\n"
             f"New Time: {a.time_label}{provider}\n"
             f"Location: {a.location_name}\n\n"
-            "We'll see you then! Reply anytime if you need anything else. - Maya"
+            "We'll see you then!"
         )
     else:
         confirm_reply = (
@@ -841,17 +1015,11 @@ def _handle_slot_selection(
             f"Date: {a.date_label}\n"
             f"Time: {a.time_label}{provider}\n"
             f"Location: {a.location_name}\n\n"
-            "We'll see you then! Reply anytime if you need to make changes. - Maya"
+            "We'll see you then!"
         )
 
-    new_state = state.model_copy(
-        update={
-            "step": "confirmed",
-            "appointment_id": a.id,
-            "slot_options": [],
-            "selected_slot_id": slot_id,
-        }
-    )
+    confirm_reply = _append_maya_thread_signoff(confirm_reply)
+    new_state = workflow_state_after_completed_flow(state)
     return ChatResponse(
         reply=confirm_reply,
         state=new_state,
@@ -1083,12 +1251,12 @@ def _dispatch_emergency_notification(
     if callback_notif.success:
         tools_called.append("create_staff_notification:callback")
 
-    reply = (
+    reply = _append_maya_thread_signoff(
         "I've notified our team and they'll call you back as soon as possible — "
         "this has been flagged as urgent. Please don't wait if you're in severe pain; "
         "go to your nearest emergency dental clinic or call 911 if it's a medical emergency."
     )
-    new_state = state.model_copy(update={"step": "confirmed"})
+    new_state = workflow_state_after_completed_flow(state)
     return reply, new_state, tools_called
 
 
@@ -1239,11 +1407,11 @@ def _dispatch_family_booking(
         )
 
     if len(booking_members) < 2:
-        reply = (
+        reply = _append_maya_thread_signoff(
             "I need at least two people with chart IDs I can book into before I can reserve slots together. "
             "I've sent your family details to our team — someone will call to finish setting everyone up."
         )
-        new_state = state.model_copy(update={"step": "confirmed"})
+        new_state = workflow_state_after_completed_flow(state)
         return reply, new_state, ["create_staff_notification"]
 
     payload = BookFamilyAppointmentsInput(
@@ -1267,11 +1435,11 @@ def _dispatch_family_booking(
                 f"{i + 1}. {a.patient_name} — {a.appointment_type_display} — {a.date_label}, {a.time_label}"
                 for i, a in enumerate(result.appointments)
             )
-            reply = (
+            reply = _append_maya_thread_signoff(
                 f"All set — here's one appointment per person:\n\n{appt_lines}\n\n"
                 "You'll get a confirmation for each. See you all soon!"
             )
-            new_state = state.model_copy(update={"step": "confirmed", "collected_fields": new_cf})
+            new_state = workflow_state_after_completed_flow(state)
             return reply, new_state, tools_called
 
         booked_count = len(result.appointments)
@@ -1294,7 +1462,7 @@ def _dispatch_family_booking(
         tools_called.append("create_staff_notification")
 
         if booked_count == 0:
-            reply = (
+            reply = _append_maya_thread_signoff(
                 "Those times are no longer available. I've flagged our team — they'll call to coordinate."
             )
         else:
@@ -1302,13 +1470,13 @@ def _dispatch_family_booking(
                 f"{i + 1}. {a.patient_name} — {a.appointment_type_display} — {a.date_label}, {a.time_label}"
                 for i, a in enumerate(result.appointments)
             )
-            reply = (
+            reply = _append_maya_thread_signoff(
                 f"I booked {booked_count} appointment(s):\n\n{booked_lines}\n\n"
                 f"I couldn't confirm the remaining slot(s) — they may have been taken. "
                 "Our team will follow up."
             )
 
-        new_state = state.model_copy(update={"step": "confirmed", "collected_fields": new_cf})
+        new_state = workflow_state_after_completed_flow(state)
         return reply, new_state, tools_called
 
     # First step: find slots and show exact times — book only after a second yes.
@@ -1355,9 +1523,9 @@ def _dispatch_family_booking(
     )
     tools_called.append("create_staff_notification")
 
-    reply = (
+    reply = _append_maya_thread_signoff(
         "I couldn't find grouped slots that work for everyone in that window. "
         "I've flagged our team — they'll call to coordinate times."
     )
-    new_state = state.model_copy(update={"step": "confirmed"})
+    new_state = workflow_state_after_completed_flow(state)
     return reply, new_state, tools_called

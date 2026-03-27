@@ -44,6 +44,49 @@ _NAME_LEAD_PATTERNS = [
     r"(?:i go by)\s+([A-Za-z][a-zA-Z\-']+(?:\s+[A-Za-z][a-zA-Z\-']+)+)",
 ]
 
+# Two-word phrases like "cancel appointment" / "new patient" match the bare-name fallback
+# but are booking intent, not a person's name.
+_NAME_FALSE_POSITIVE_WORDS = frozenset({
+    "cancel", "appointment", "appointments", "reschedule", "rescheduling",
+    "booking", "book", "booked", "cancelled", "canceled", "schedule", "scheduling",
+    "new", "patient", "patients", "existing", "dentist", "dental", "teeth", "cleaning",
+    "checkup", "check-up", "visit", "family", "emergency", "urgent",
+})
+
+
+def is_false_positive_name_pair(first_name: str | None, last_name: str | None) -> bool:
+    """True when both tokens look like scheduling intent words, not a real name pair."""
+    if not first_name or not last_name:
+        return False
+    f = first_name.strip().lower()
+    l = last_name.strip().lower()
+    return f in _NAME_FALSE_POSITIVE_WORDS and l in _NAME_FALSE_POSITIVE_WORDS
+
+
+def merge_extracted_name_into_collected(
+    collected: dict[str, Any],
+    name_dict: dict[str, str] | None,
+) -> None:
+    """
+    Merge extract_full_name() output into collected_fields.
+    Overwrites a bogus intent pair (e.g. Cancel / Appointment) when a real name is found.
+    """
+    if not name_dict:
+        return
+    fn_new = name_dict.get("first_name")
+    ln_new = name_dict.get("last_name")
+    if is_false_positive_name_pair(fn_new, ln_new):
+        return
+    fn_old = collected.get("first_name")
+    ln_old = collected.get("last_name")
+    if is_false_positive_name_pair(fn_old, ln_old):
+        collected.pop("first_name", None)
+        collected.pop("last_name", None)
+    if fn_new:
+        collected["first_name"] = fn_new
+    if ln_new:
+        collected["last_name"] = ln_new
+
 
 def extract_full_name(text: str) -> dict[str, str] | None:
     """
@@ -58,18 +101,20 @@ def extract_full_name(text: str) -> dict[str, str] | None:
         if m:
             parts = m.group(1).strip().split()
             if len(parts) >= 2:
-                return {
-                    "first_name": _title(parts[0]),
-                    "last_name": _title(" ".join(parts[1:])),
-                }
+                fn = _title(parts[0])
+                ln = _title(" ".join(parts[1:]))
+                if is_false_positive_name_pair(fn, ln):
+                    continue
+                return {"first_name": fn, "last_name": ln}
 
     # Fallback: message is entirely a name-like string (≤4 words, all title-case-ish)
     words = text.strip().split()
     if 2 <= len(words) <= 4 and all(re.match(r"^[A-Za-z\-']{2,}$", w) for w in words):
-        return {
-            "first_name": _title(words[0]),
-            "last_name": _title(" ".join(words[1:])),
-        }
+        fn = _title(words[0])
+        ln = _title(" ".join(words[1:]))
+        if is_false_positive_name_pair(fn, ln):
+            return None
+        return {"first_name": fn, "last_name": ln}
     return None
 
 
@@ -427,23 +472,81 @@ _WEEKDAY_MAP: dict[str, int] = {
     "sun": 6,
 }
 
+_WEEKDAY_FULL_NAMES = (
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+)
+
+
+def _monday_of_next_calendar_week(ref: date) -> date:
+    """Monday that starts the week after the one containing ``ref``."""
+    days_until_next_mon = (7 - ref.weekday()) % 7 or 7
+    return ref + timedelta(days=days_until_next_mon)
+
+
+def _date_in_week_of(monday: date, weekday_num: int) -> date:
+    """``monday`` must be a Monday; return the given weekday in that same week."""
+    return monday + timedelta(days=(weekday_num - monday.weekday()) % 7)
+
+
+def _next_week_weekday(ref: date, weekday_num: int) -> date:
+    """Friday of next week, etc. — Monday of next week + offset to that weekday."""
+    mon = _monday_of_next_calendar_week(ref)
+    return _date_in_week_of(mon, weekday_num)
+
 
 def extract_preferred_date(text: str, today: date | None = None) -> date | None:
     """
     Handles relative expressions (tomorrow, next week, next Monday…)
     and explicit dates (April 5, 2026-04-05, etc.).
+
+    Explicit month/day is resolved *before* weekday words so phrases like
+    "Friday Apr 3" resolve to April 3, not the nearest Friday.
     """
     ref = today or date.today()
     lower = text.lower()
+    stripped = (text or "").strip()
 
     if "today" in lower:
         return ref
     if "tomorrow" in lower:
         return ref + timedelta(days=1)
+
+    # Explicit numeric / written dates first (avoid "Friday" winning over "Apr 3").
+    d_ob = extract_dob(stripped)
+    if d_ob is not None and d_ob >= ref:
+        return d_ob
+
+    # "March 27" / "April 5th" / "apr 3" — month name or abbreviation + day (+ optional year)
+    m = re.search(
+        r"\b([A-Za-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s*,\s*(\d{4}))?\b",
+        lower,
+    )
+    if m and m.group(1) in _MONTHS:
+        month = _MONTHS[m.group(1)]
+        day = int(m.group(2))
+        year_g = m.group(3)
+        if year_g:
+            cand = _safe_date(int(year_g), month, day)
+            if cand and cand >= ref:
+                return cand
+        else:
+            cand = _safe_date(ref.year, month, day)
+            if cand:
+                return cand if cand >= ref else _safe_date(ref.year + 1, month, day) or cand
+
+    # "next week" + weekday → that weekday in the following calendar week (not Monday-only).
     if "next week" in lower:
-        # Monday of next week
-        days_until_next_mon = (7 - ref.weekday()) % 7 or 7
-        return ref + timedelta(days=days_until_next_mon)
+        for wname in _WEEKDAY_FULL_NAMES:
+            if re.search(r"\b" + wname + r"\b", lower):
+                return _next_week_weekday(ref, _WEEKDAY_MAP[wname])
+        return _monday_of_next_calendar_week(ref)
+
     if "this week" in lower:
         return ref
     # "first day of next month", "beginning of next month"
@@ -480,21 +583,21 @@ def extract_preferred_date(text: str, today: date | None = None) -> date | None:
         next_y = ref.year if ref.month < 12 else ref.year + 1
         return date(next_y, next_m, 1)
 
+    # "next Friday" (without "week") → that weekday in the *next* calendar week
+    m = re.search(
+        r"\bnext\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+        lower,
+    )
+    if m:
+        return _next_week_weekday(ref, _WEEKDAY_MAP[m.group(1)])
+
+    # Bare weekday / "this Friday" → next calendar occurrence (often this week's day)
     for day_name, day_num in _WEEKDAY_MAP.items():
         if re.search(r"\b" + day_name + r"\b", lower):
             days_ahead = (day_num - ref.weekday()) % 7
             if days_ahead == 0:
                 days_ahead = 7
             return ref + timedelta(days=days_ahead)
-
-    # "March 27" / "April 5th" — month name + day without year → assume this/next year
-    m = re.search(r"\b([A-Za-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?\b", lower)
-    if m and m.group(1) in _MONTHS:
-        month = _MONTHS[m.group(1)]
-        day = int(m.group(2))
-        candidate = _safe_date(ref.year, month, day)
-        if candidate:
-            return candidate if candidate >= ref else _safe_date(ref.year + 1, month, day) or candidate
 
     # "the 27th" / "on the 15th" — bare ordinal day → assume current month or next
     m = re.search(r"\b(?:the\s+)?(\d{1,2})(?:st|nd|rd|th)\b", lower)
@@ -557,6 +660,15 @@ def extract_emergency_summary(text: str) -> str | None:
 
 def extract_cancel_reason(text: str) -> str | None:
     stripped = text.strip()
+    if not stripped:
+        return None
+    # Prompts often say a reason is optional; treat short declines as "no specific reason".
+    if re.match(
+        r"^(no|nope|nah|n/a|na|none|nothing|not sure|idk|no preference|no reason)[\s.!]*$",
+        stripped,
+        re.IGNORECASE,
+    ):
+        return "Scheduling / no specific reason"
     if len(stripped) < 3:
         return None
     if re.match(r"^(yes|no|ok|okay|sure)[\s.!]*$", stripped, re.IGNORECASE):
@@ -609,6 +721,20 @@ def extract_slot_choice(text: str) -> int | None:
     m = re.search(r"(?:option|number|slot|#)\s*([1-5])", lower)
     if m:
         return int(m.group(1))
+
+    # Month + day ("Apr 3", "Friday Apr 3") — the number is a calendar day, not slot 1–5
+    if re.search(
+        r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept?|oct|nov|dec|january|february|march|april|june|july|august|september|october|november|december)\s+\d{1,2}(?:st|nd|rd|th)?\b",
+        lower,
+    ):
+        return None
+    # Slash dates (3/4, 04/03/26)
+    if re.search(r"\b\d{1,2}\s*[/\-]\s*\d{1,2}(?:\s*[/\-]\s*\d{2,4})?\b", lower):
+        return None
+
+    # Clock times ("3 pm", "10:30 am") — not slot 1–5
+    if re.search(r"\b\d{1,2}\s*(:\s*\d{2})?\s*(pm|p\.m|am|a\.m)\b", lower):
+        return None
 
     # bare digit 1-5 with word boundary
     m = re.search(r"\b([1-5])\b", lower)

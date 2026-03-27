@@ -252,7 +252,7 @@ def list_patient_appointments(
             select(Appointment)
             .where(
                 Appointment.patient_id == payload.patient_id,
-                Appointment.status.notin_(["cancelled", "no_show"]),
+                Appointment.status.notin_(["cancelled", "no_show", "rescheduled"]),
                 Appointment.scheduled_starts_at >= now,
             )
             .order_by(Appointment.scheduled_starts_at.asc())

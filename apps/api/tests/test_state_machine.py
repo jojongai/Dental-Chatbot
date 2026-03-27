@@ -310,10 +310,11 @@ class TestBookAppointment:
 
 
 class TestRescheduleAppointment:
-    def test_requires_patient_type_gate_when_no_patient_id(self):
+    def test_pivots_to_verification_when_no_patient_id(self):
         result = run(make_state(), "I need to reschedule my appointment")
-        assert result.state.workflow == Workflow.RESCHEDULE_APPOINTMENT
-        assert result.state.step == "awaiting_patient_type"
+        assert result.state.workflow == Workflow.EXISTING_PATIENT_VERIFICATION
+        assert result.state.collected_fields.get("_pending_workflow") == "reschedule_appointment"
+        assert result.state.step == "collecting:first_name"
 
     def test_ready_when_date_present_with_patient_id(self):
         state = make_state(
@@ -339,10 +340,11 @@ class TestRescheduleAppointment:
 
 
 class TestCancelAppointment:
-    def test_requires_patient_type_gate_when_no_patient_id(self):
+    def test_pivots_to_verification_when_no_patient_id(self):
         result = run(make_state(), "I need to cancel my appointment")
-        assert result.state.workflow == Workflow.CANCEL_APPOINTMENT
-        assert result.state.step == "awaiting_patient_type"
+        assert result.state.workflow == Workflow.EXISTING_PATIENT_VERIFICATION
+        assert result.state.collected_fields.get("_pending_workflow") == "cancel_appointment"
+        assert result.state.step == "collecting:first_name"
 
     def test_requires_cancel_reason(self):
         wf = WORKFLOWS[Workflow.CANCEL_APPOINTMENT]
@@ -550,13 +552,17 @@ class TestPatientTypeGate:
         result = run(state, "morning")
         assert result.state.workflow == Workflow.BOOK_APPOINTMENT
 
-    def test_reschedule_triggers_gate(self):
+    def test_reschedule_skips_gate_goes_to_verification(self):
         result = run(make_state(), "I need to reschedule")
-        assert result.state.step == "awaiting_patient_type"
+        assert result.state.workflow == Workflow.EXISTING_PATIENT_VERIFICATION
+        assert result.state.collected_fields.get("_pending_workflow") == "reschedule_appointment"
+        assert result.state.step == "collecting:first_name"
 
-    def test_cancel_triggers_gate(self):
+    def test_cancel_skips_gate_goes_to_verification(self):
         result = run(make_state(), "I need to cancel my appointment")
-        assert result.state.step == "awaiting_patient_type"
+        assert result.state.workflow == Workflow.EXISTING_PATIENT_VERIFICATION
+        assert result.state.collected_fields.get("_pending_workflow") == "cancel_appointment"
+        assert result.state.step == "collecting:first_name"
 
 
 # ---------------------------------------------------------------------------
@@ -837,6 +843,44 @@ class TestPreferredDateExtractor:
         result = run(state, "next week")
         pdf = result.state.collected_fields.get("preferred_date_from")
         assert isinstance(pdf, _date), f"Expected date object, got {type(pdf)}: {pdf}"
+
+    def test_next_week_friday_is_friday_not_monday(self):
+        from datetime import date
+        from state_machine.extractors import extract_preferred_date
+
+        wed = date(2026, 3, 25)  # Wednesday
+        r = extract_preferred_date("next week friday", today=wed)
+        assert r is not None
+        assert r.weekday() == 4  # Friday
+        assert r == date(2026, 4, 3)
+
+    def test_friday_apr_3_is_explicit_date_not_next_friday(self):
+        from datetime import date
+        from state_machine.extractors import extract_preferred_date
+
+        wed = date(2026, 3, 25)
+        r = extract_preferred_date("Friday Apr 3", today=wed)
+        assert r == date(2026, 4, 3)
+
+    def test_next_friday_is_in_following_week(self):
+        from datetime import date
+        from state_machine.extractors import extract_preferred_date
+
+        wed = date(2026, 3, 25)
+        r = extract_preferred_date("next Friday", today=wed)
+        assert r == date(2026, 4, 3)
+
+    def test_slot_choice_ignores_day_in_apr_3(self):
+        from state_machine.extractors import extract_slot_choice
+
+        assert extract_slot_choice("Friday Apr 3") is None
+        assert extract_slot_choice("option 3") == 3
+
+    def test_slot_choice_ignores_clock_time_not_slot_three(self):
+        from state_machine.extractors import extract_slot_choice
+
+        assert extract_slot_choice("can we do 3 pm?") is None
+        assert extract_slot_choice("10:30 am works") is None
 
 
 # ---------------------------------------------------------------------------
