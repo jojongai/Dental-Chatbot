@@ -12,7 +12,7 @@ The **dental-chatbot** monorepo separates the user-facing web app, the HTTP API,
 | `apps/api`              | **FastAPI + Pydantic**: REST (`/chat`, `/v1/employee/schedule` for the employee calendar, tools, validation).   |
 | `packages/shared-types` | **Zod** schemas / TypeScript types mirrored loosely in Python (**Pydantic**) for request/response shapes.       |
 | `packages/prompts`      | System prompts and reusable prompt fragments (Markdown or structured text).                                     |
-| `infra/seed`            | Seed data and scripts for local or demo environments.                                                           |
+| `apps/api/seed.py`      | Demo seed (`python seed.py`; `--reset` on SQLite). DB file under `apps/api/data/` by default.                  |
 
 ## Persistence
 
