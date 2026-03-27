@@ -1,6 +1,6 @@
 # Dental Office Chatbot — Project Documentation
 
-**[Customize: course name, term, author(s)]**
+**Jojo Ngai**
 
 This document describes a working prototype of an SMS-style dental office assistant: it answers common questions, guides patients through booking and related tasks, and integrates a staff-facing schedule view. It is written for evaluators who need a clear picture of scope, architecture, and how to run the software locally.
 
