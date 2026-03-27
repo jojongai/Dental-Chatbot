@@ -245,11 +245,29 @@ class TestExistingPatientVerification:
 
 
 class TestBookAppointment:
-    def test_redirects_to_verification_when_no_patient_id(self):
-        state = make_state(workflow=Workflow.BOOK_APPOINTMENT, step="start")
-        result = run(state, "I want to book a cleaning")
-        # Machine should pivot to verification sub-workflow
+    def test_redirects_to_patient_type_gate_when_no_patient_id(self):
+        # Booking from GENERAL_INQUIRY triggers the "new or existing?" gate
+        result = run(make_state(), "I want to book a cleaning")
+        assert result.state.workflow == Workflow.BOOK_APPOINTMENT
+        assert result.state.step == "awaiting_patient_type"
+
+    def test_existing_answer_routes_to_verification(self):
+        state = make_state(
+            workflow=Workflow.BOOK_APPOINTMENT,
+            step="awaiting_patient_type",
+            collected_fields={"_pending_workflow": "book_appointment"},
+        )
+        result = run(state, "I'm an existing patient")
         assert result.state.workflow == Workflow.EXISTING_PATIENT_VERIFICATION
+
+    def test_new_answer_routes_to_registration(self):
+        state = make_state(
+            workflow=Workflow.BOOK_APPOINTMENT,
+            step="awaiting_patient_type",
+            collected_fields={"_pending_workflow": "book_appointment"},
+        )
+        result = run(state, "I'm a new patient")
+        assert result.state.workflow == Workflow.NEW_PATIENT_REGISTRATION
 
     def test_ready_when_patient_id_and_fields_present(self):
         state = make_state(
@@ -292,10 +310,10 @@ class TestBookAppointment:
 
 
 class TestRescheduleAppointment:
-    def test_requires_verification_when_no_patient_id(self):
-        state = make_state(workflow=Workflow.RESCHEDULE_APPOINTMENT, step="start")
-        result = run(state, "I want to reschedule")
-        assert result.state.workflow == Workflow.EXISTING_PATIENT_VERIFICATION
+    def test_requires_patient_type_gate_when_no_patient_id(self):
+        result = run(make_state(), "I need to reschedule my appointment")
+        assert result.state.workflow == Workflow.RESCHEDULE_APPOINTMENT
+        assert result.state.step == "awaiting_patient_type"
 
     def test_ready_when_date_present_with_patient_id(self):
         state = make_state(
@@ -321,10 +339,10 @@ class TestRescheduleAppointment:
 
 
 class TestCancelAppointment:
-    def test_requires_verification_when_no_patient_id(self):
-        state = make_state(workflow=Workflow.CANCEL_APPOINTMENT, step="start")
-        result = run(state, "cancel my appointment")
-        assert result.state.workflow == Workflow.EXISTING_PATIENT_VERIFICATION
+    def test_requires_patient_type_gate_when_no_patient_id(self):
+        result = run(make_state(), "I need to cancel my appointment")
+        assert result.state.workflow == Workflow.CANCEL_APPOINTMENT
+        assert result.state.step == "awaiting_patient_type"
 
     def test_requires_cancel_reason(self):
         wf = WORKFLOWS[Workflow.CANCEL_APPOINTMENT]
@@ -426,10 +444,11 @@ class TestEmergencyTriage:
 
 class TestFamilyBooking:
     def test_enters_family_booking_on_keyword(self):
-        # Family booking requires patient_id, so the machine correctly pivots to
-        # EXISTING_PATIENT_VERIFICATION first, storing _pending_workflow=family_booking.
+        # Family booking requires patient_id, so the gate asks "new or existing?"
+        # before pivoting to verification or new-patient registration.
         result = run(make_state(), "I need to book appointments for me and my kids")
-        assert result.state.workflow == Workflow.EXISTING_PATIENT_VERIFICATION
+        assert result.state.workflow == Workflow.FAMILY_BOOKING
+        assert result.state.step == "awaiting_patient_type"
         assert result.state.collected_fields.get("_pending_workflow") == Workflow.FAMILY_BOOKING.value
 
     def test_required_fields(self):
@@ -478,6 +497,370 @@ class TestMachineStatus:
 # ---------------------------------------------------------------------------
 # Cross-cutting: workflow required fields are all defined in FIELDS
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Patient-type gate (Phase 2)
+# ---------------------------------------------------------------------------
+
+
+class TestPatientTypeGate:
+    def test_booking_asks_new_or_existing(self):
+        result = run(make_state(), "I want to book a cleaning")
+        assert result.state.workflow == Workflow.BOOK_APPOINTMENT
+        assert result.state.step == "awaiting_patient_type"
+        assert "new or existing" in result.reply.lower()
+        assert "is it urgent" not in result.reply.lower(), "Gate should ask one clean question"
+
+    def test_new_answer_routes_to_registration(self):
+        state = make_state(
+            workflow=Workflow.BOOK_APPOINTMENT,
+            step="awaiting_patient_type",
+            collected_fields={"_pending_workflow": "book_appointment"},
+        )
+        result = run(state, "I'm a new patient")
+        assert result.state.workflow == Workflow.NEW_PATIENT_REGISTRATION
+
+    def test_existing_answer_routes_to_verification(self):
+        state = make_state(
+            workflow=Workflow.BOOK_APPOINTMENT,
+            step="awaiting_patient_type",
+            collected_fields={"_pending_workflow": "book_appointment"},
+        )
+        result = run(state, "I'm an existing patient")
+        assert result.state.workflow == Workflow.EXISTING_PATIENT_VERIFICATION
+
+    def test_unclear_answer_asks_again(self):
+        state = make_state(
+            workflow=Workflow.BOOK_APPOINTMENT,
+            step="awaiting_patient_type",
+            collected_fields={"_pending_workflow": "book_appointment"},
+        )
+        result = run(state, "hmm not sure")
+        assert result.state.step == "awaiting_patient_type"
+
+    def test_gate_skipped_when_patient_id_present(self):
+        state = make_state(
+            workflow=Workflow.BOOK_APPOINTMENT,
+            step="collecting",
+            patient_id="patient-uuid-001",
+            collected_fields={"appointment_type": "cleaning", "preferred_date_from": "2026-04-07"},
+        )
+        result = run(state, "morning")
+        assert result.state.workflow == Workflow.BOOK_APPOINTMENT
+
+    def test_reschedule_triggers_gate(self):
+        result = run(make_state(), "I need to reschedule")
+        assert result.state.step == "awaiting_patient_type"
+
+    def test_cancel_triggers_gate(self):
+        result = run(make_state(), "I need to cancel my appointment")
+        assert result.state.step == "awaiting_patient_type"
+
+
+# ---------------------------------------------------------------------------
+# Failed-lookup registration routing (Phase 3)
+# ---------------------------------------------------------------------------
+
+
+class TestFailedLookupRegistration:
+    def test_yes_after_failed_lookup_routes_to_registration(self):
+        state = make_state(
+            workflow=Workflow.EXISTING_PATIENT_VERIFICATION,
+            step="collecting",
+            collected_fields={"_lookup_failed_offer_registration": True},
+        )
+        result = run(state, "yes I'd like to register")
+        assert result.state.workflow == Workflow.NEW_PATIENT_REGISTRATION
+
+    def test_register_phrase_routes_to_registration(self):
+        state = make_state(
+            workflow=Workflow.EXISTING_PATIENT_VERIFICATION,
+            step="collecting",
+            collected_fields={"_lookup_failed_offer_registration": True},
+        )
+        result = run(state, "I'd like to register as a new patient")
+        assert result.state.workflow == Workflow.NEW_PATIENT_REGISTRATION
+
+    def test_stays_in_verification_without_flag(self):
+        state = make_state(
+            workflow=Workflow.EXISTING_PATIENT_VERIFICATION,
+            step="collecting",
+        )
+        result = run(state, "yes I'd like to register")
+        assert result.state.workflow == Workflow.EXISTING_PATIENT_VERIFICATION
+
+
+# ---------------------------------------------------------------------------
+# Name merge fix (Phase 4)
+# ---------------------------------------------------------------------------
+
+
+class TestNameMergeFix:
+    def test_last_name_fills_when_first_already_set(self):
+        """When first_name is set but last_name is missing, providing full name
+        should fill last_name without overwriting first_name."""
+        state = make_state(
+            workflow=Workflow.NEW_PATIENT_REGISTRATION,
+            step="collecting:first_name",
+            collected_fields={"first_name": "Joseph"},
+        )
+        result = run(state, "Joseph Ngai")
+        assert result.state.collected_fields.get("first_name") == "Joseph"
+        assert result.state.collected_fields.get("last_name") == "Ngai"
+
+    def test_both_names_extracted_from_fresh(self):
+        state = make_state(workflow=Workflow.NEW_PATIENT_REGISTRATION, step="collecting")
+        result = run(state, "My name is Alice Chen")
+        assert result.state.collected_fields.get("first_name") == "Alice"
+        assert result.state.collected_fields.get("last_name") == "Chen"
+
+
+# ---------------------------------------------------------------------------
+# is_first_turn greeting (Phase 5)
+# ---------------------------------------------------------------------------
+
+
+class TestFirstTurnGreeting:
+    def test_first_turn_includes_greeting(self):
+        result = run(make_state(), "I want to register as a new patient")
+        assert result.state.workflow == Workflow.NEW_PATIENT_REGISTRATION
+        wf_def = WORKFLOWS[Workflow.NEW_PATIENT_REGISTRATION]
+        if wf_def.greeting:
+            assert wf_def.greeting in result.reply
+
+
+# ---------------------------------------------------------------------------
+# Mid-flow guard escapes (Phase 5)
+# ---------------------------------------------------------------------------
+
+
+class TestMidFlowEscapes:
+    def test_emergency_escapes_mid_flow(self):
+        state = make_state(
+            workflow=Workflow.BOOK_APPOINTMENT,
+            step="collecting",
+            patient_id="p1",
+        )
+        result = run(state, "I'm in severe pain, this is an emergency")
+        assert result.state.workflow == Workflow.EMERGENCY_TRIAGE
+
+    def test_not_urgent_does_not_trigger_emergency(self):
+        """'Not urgent' should NOT trigger the emergency guardrail."""
+        from state_machine.machine import _is_emergency
+        assert _is_emergency("not urgent, I'm a new patient") is False
+        assert _is_emergency("it's not urgent") is False
+        assert _is_emergency("no emergency, just a cleaning") is False
+
+    def test_actual_urgent_still_triggers(self):
+        from state_machine.machine import _is_emergency
+        assert _is_emergency("this is urgent") is True
+        assert _is_emergency("I have an emergency") is True
+        assert _is_emergency("severe pain in my tooth") is True
+
+    def test_not_urgent_new_patient_routes_correctly(self):
+        """User answering 'not urgent, new patient' at the gate should route to registration."""
+        state = make_state(
+            workflow=Workflow.BOOK_APPOINTMENT,
+            step="awaiting_patient_type",
+            collected_fields={"_pending_workflow": "book_appointment"},
+        )
+        result = run(state, "Not urgent, I'm a new patient")
+        assert result.state.workflow == Workflow.NEW_PATIENT_REGISTRATION
+
+    def test_actually_cancel_escapes(self):
+        from state_machine.machine import detect_intent
+        state = make_state(
+            workflow=Workflow.BOOK_APPOINTMENT,
+            step="collecting",
+            patient_id="p1",
+        )
+        wf = detect_intent("actually i want to cancel my appointment", state)
+        assert wf == Workflow.CANCEL_APPOINTMENT
+
+    def test_speak_to_someone_escapes(self):
+        from state_machine.machine import detect_intent
+        state = make_state(
+            workflow=Workflow.NEW_PATIENT_REGISTRATION,
+            step="collecting",
+        )
+        wf = detect_intent("speak to someone please", state)
+        assert wf == Workflow.HANDOFF
+
+    def test_start_over_resets(self):
+        from state_machine.machine import detect_intent
+        state = make_state(
+            workflow=Workflow.BOOK_APPOINTMENT,
+            step="collecting",
+            patient_id="p1",
+        )
+        wf = detect_intent("start over", state)
+        assert wf == Workflow.GENERAL_INQUIRY
+
+
+# ---------------------------------------------------------------------------
+# Recursion depth guard (Phase 6)
+# ---------------------------------------------------------------------------
+
+
+class TestRecursionDepthGuard:
+    def test_depth_guard_returns_safe_fallback(self):
+        machine = WorkflowStateMachine(make_state())
+        result = machine.process("hello", _depth=3)
+        assert "went wrong" in result.reply.lower() or "try again" in result.reply.lower()
+
+    def test_normal_depth_works(self):
+        result = run(make_state(), "I have a dental emergency, severe pain")
+        assert result.state.workflow == Workflow.EMERGENCY_TRIAGE
+
+
+# ---------------------------------------------------------------------------
+# Cross-cutting: workflow required fields are all defined in FIELDS
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Duplicate greeting fix
+# ---------------------------------------------------------------------------
+
+
+class TestGreetingNoDuplicate:
+    def test_new_patient_registration_greeting_no_duplicate_name_prompt(self):
+        """Greeting should NOT end with the same question _ask_next_field produces."""
+        state = make_state(
+            workflow=Workflow.BOOK_APPOINTMENT,
+            step="awaiting_patient_type",
+            collected_fields={"_pending_workflow": "book_appointment"},
+        )
+        result = run(state, "I'm a new patient")
+        assert result.state.workflow == Workflow.NEW_PATIENT_REGISTRATION
+        occurrences = result.reply.lower().count("full name")
+        assert occurrences == 1, f"'full name' appears {occurrences} times in: {result.reply}"
+
+
+# ---------------------------------------------------------------------------
+# Date extractor — month+day without year
+# ---------------------------------------------------------------------------
+
+
+class TestPreferredDateExtractor:
+    def test_month_day_without_year_uses_current_year(self):
+        from datetime import date
+        from state_machine.extractors import extract_preferred_date
+        result = extract_preferred_date("March 27", today=date(2026, 3, 26))
+        assert result is not None
+        assert result.year == 2026
+        assert result.month == 3
+        assert result.day == 27
+
+    def test_past_month_day_rolls_to_next_year(self):
+        from datetime import date
+        from state_machine.extractors import extract_preferred_date
+        result = extract_preferred_date("January 5", today=date(2026, 3, 26))
+        assert result is not None
+        assert result.year == 2027
+
+    def test_ordinal_day(self):
+        from datetime import date
+        from state_machine.extractors import extract_preferred_date
+        result = extract_preferred_date("the 15th", today=date(2026, 3, 10))
+        assert result is not None
+        assert result.day == 15
+        assert result.month == 3
+
+    def test_explicit_date_with_year_still_works(self):
+        from datetime import date
+        from state_machine.extractors import extract_preferred_date
+        result = extract_preferred_date("2026-04-15")
+        assert result == date(2026, 4, 15)
+
+    def test_first_day_of_next_month(self):
+        from datetime import date
+        from state_machine.extractors import extract_preferred_date
+        result = extract_preferred_date("first day of next month", today=date(2026, 3, 26))
+        assert result == date(2026, 4, 1)
+
+    def test_next_month_returns_first_of_month(self):
+        from datetime import date
+        from state_machine.extractors import extract_preferred_date
+        result = extract_preferred_date("next month", today=date(2026, 3, 26))
+        assert result == date(2026, 4, 1)
+
+    def test_beginning_of_named_month(self):
+        from datetime import date
+        from state_machine.extractors import extract_preferred_date
+        result = extract_preferred_date("beginning of april", today=date(2026, 3, 26))
+        assert result == date(2026, 4, 1)
+
+    def test_end_of_next_month(self):
+        from datetime import date
+        from state_machine.extractors import extract_preferred_date
+        result = extract_preferred_date("end of next month", today=date(2026, 3, 26))
+        assert result == date(2026, 4, 30)
+
+    def test_invalid_phone_gives_format_hint(self):
+        """Invalid phone input should re-ask with a format example."""
+        state = make_state(
+            workflow=Workflow.NEW_PATIENT_REGISTRATION,
+            step="collecting:phone_number",
+            collected_fields={"first_name": "Test", "last_name": "User"},
+        )
+        result = run(state, "12345678")
+        assert "10-digit" in result.reply.lower() or "416-555-1234" in result.reply
+
+    def test_invalid_dob_gives_format_hint(self):
+        """Invalid DOB input should re-ask with a format example."""
+        state = make_state(
+            workflow=Workflow.NEW_PATIENT_REGISTRATION,
+            step="collecting:date_of_birth",
+            collected_fields={"first_name": "Test", "last_name": "User", "phone_number": "4165551234"},
+        )
+        result = run(state, "10 01 2008")
+        assert "format" in result.reply.lower() or "03/14/1990" in result.reply
+
+    def test_relative_date_resolved_to_date_object_in_machine(self):
+        """'next week' should be stored as a date object, not the raw string."""
+        from datetime import date as _date
+        state = make_state(
+            workflow=Workflow.NEW_PATIENT_REGISTRATION,
+            step="collecting:preferred_date_from",
+            collected_fields={
+                "first_name": "Test",
+                "last_name": "User",
+                "phone_number": "4165551234",
+                "date_of_birth": _date(1990, 1, 1),
+                "insurance_name": "self_pay",
+                "appointment_type": "cleaning",
+            },
+        )
+        result = run(state, "next week")
+        pdf = result.state.collected_fields.get("preferred_date_from")
+        assert isinstance(pdf, _date), f"Expected date object, got {type(pdf)}: {pdf}"
+
+
+# ---------------------------------------------------------------------------
+# LLM normaliser — first_name split
+# ---------------------------------------------------------------------------
+
+
+class TestNameNormalisation:
+    def test_full_name_in_first_name_is_split(self):
+        from llm.interpreter import _normalise_extracted
+        result = _normalise_extracted({"first_name": "Joseph Ngai"})
+        assert result["first_name"] == "Joseph"
+        assert result["last_name"] == "Ngai"
+
+    def test_single_first_name_kept(self):
+        from llm.interpreter import _normalise_extracted
+        result = _normalise_extracted({"first_name": "Joseph"})
+        assert result["first_name"] == "Joseph"
+        assert "last_name" not in result
+
+    def test_explicit_last_name_not_overwritten(self):
+        from llm.interpreter import _normalise_extracted
+        result = _normalise_extracted({"first_name": "Joseph Ngai", "last_name": "Smith"})
+        assert result["first_name"] == "Joseph"
+        assert result["last_name"] == "Smith"
 
 
 class TestDefinitionsConsistency:

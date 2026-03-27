@@ -185,12 +185,99 @@ def _needs_llm(inp: InterpreterInput) -> bool:
     if not inp.missing_field_hints and inp.step in ("collecting", "start", "verify_identity"):
         return False
 
+    # Rule 5 — existing-patient verification: classify_intent() already picked the workflow;
+    # name/phone are filled by _keyword_interpret + regex overrides in the machine.
+    # The LLM sees the original intent phrase (e.g. "I'd like to book an appointment") and
+    # returns SWITCH → book_appointment, causing infinite recursion.
+    if inp.step == "verify_identity":
+        return False
+
+    # Rule 6 — new vs returning gate: keyword parser only.
+    if inp.step == "awaiting_patient_type":
+        return False
+
     return True
 
 
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
+
+
+def interpret_registration_followup(message: str) -> InterpreterOutput:
+    """
+    Interpret a reply to \"Would you like to register now?\" after new-patient FAQ.
+
+    Always uses the LLM when USE_LLM=true (bypasses the _needs_llm fast-path).
+    Falls back to extract_confirmation when USE_LLM=false or on API failure.
+    """
+    inp = InterpreterInput(
+        message=message,
+        workflow="general_inquiry",
+        step="awaiting_registration_followup",
+        pending_field=None,
+        pending_question=(
+            "Would you like to register now? (You can complete registration in this chat.)"
+        ),
+        collected_fields={},
+        missing_field_hints=[],
+    )
+    try:
+        from config import get_settings
+
+        if not get_settings().use_llm:
+            return _keyword_registration_followup(inp)
+
+        raw = _call_llm(inp)
+        return _parse_llm_response(raw, inp)
+    except Exception as exc:
+        logger.warning("interpret_registration_followup failed (%s) — keyword fallback", exc)
+        return _keyword_registration_followup(inp)
+
+
+def _keyword_registration_followup(inp: InterpreterInput) -> InterpreterOutput:
+    """USE_LLM=false / API failure: same yes/no signal as before, structured as InterpreterOutput."""
+    from state_machine.extractors import extract_confirmation
+
+    c = extract_confirmation(inp.message)
+    if c is True:
+        return InterpreterOutput(
+            primary_intent="new_patient_registration",
+            workflow_transition=WorkflowTransition.SWITCH,
+            confidence=0.85,
+            is_answering_pending_question=True,
+            extracted_fields={"confirmation": True},
+            answered_fields=["confirmation"],
+            uncertain_fields=[],
+            should_escalate=False,
+            suggested_next_action="start_new_patient_registration",
+            reasoning_summary="keyword fallback: affirmative to register",
+        )
+    if c is False:
+        return InterpreterOutput(
+            primary_intent="general_inquiry",
+            workflow_transition=WorkflowTransition.CONTINUE,
+            confidence=0.85,
+            is_answering_pending_question=True,
+            extracted_fields={"confirmation": False},
+            answered_fields=["confirmation"],
+            uncertain_fields=[],
+            should_escalate=False,
+            suggested_next_action=None,
+            reasoning_summary="keyword fallback: declined registration for now",
+        )
+    return InterpreterOutput(
+        primary_intent=None,
+        workflow_transition=WorkflowTransition.CONTINUE,
+        confidence=0.3,
+        is_answering_pending_question=False,
+        extracted_fields={},
+        answered_fields=[],
+        uncertain_fields=[],
+        should_escalate=False,
+        suggested_next_action=None,
+        reasoning_summary="keyword fallback: unclear reply to registration offer",
+    )
 
 
 def interpret(inp: InterpreterInput) -> InterpreterOutput:
@@ -304,6 +391,20 @@ def _build_user_prompt(inp: InterpreterInput) -> str:
     lines.append(f"Current workflow: {inp.workflow}")
     lines.append(f"Current step: {inp.step}")
 
+    if inp.step == "awaiting_registration_followup":
+        lines.append(
+            "\nSPECIAL CONTEXT — registration follow-up:\n"
+            "Maya just told the patient they can register in this SMS chat, explained what is needed, "
+            'and asked something like "Would you like to register now?"\n'
+            "The patient's reply below may be: agreeing to start new-patient registration (yes, sure, "
+            "let's do it, etc.), declining (no, not now), or changing the subject.\n"
+            "If they agree to register, set primary_intent to \"new_patient_registration\" with "
+            "workflow_transition \"switch\" and confidence reflecting how clear they were.\n"
+            "If they decline or are non-committal, set primary_intent to \"general_inquiry\" and "
+            "workflow_transition \"continue\".\n"
+            "You may set extracted_fields.confirmation to true/false when the reply is clearly yes or no."
+        )
+
     if inp.pending_field and inp.pending_question:
         lines.append(f'Last question asked: "{inp.pending_question}" (asking for: {inp.pending_field})')
     elif inp.pending_field:
@@ -415,9 +516,18 @@ def _normalise_extracted(extracted: dict[str, Any]) -> dict[str, Any]:
                         out[key] = True
                     elif value.lower() in ("false", "no"):
                         out[key] = False
+            elif key == "first_name":
+                name_str = str(value).strip()
+                parts = name_str.split()
+                if len(parts) >= 2:
+                    out["first_name"] = parts[0]
+                    if "last_name" not in extracted:
+                        out["last_name"] = " ".join(parts[1:])
+                else:
+                    out[key] = name_str
             elif key in (
                 "insurance_name", "preferred_date_from", "emergency_summary",
-                "cancel_reason", "first_name", "last_name",
+                "cancel_reason", "last_name",
             ):
                 out[key] = str(value).strip()
             else:

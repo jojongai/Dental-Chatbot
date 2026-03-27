@@ -577,16 +577,18 @@ def seed() -> None:
                 "insurance",
                 2,
                 "What if I don't have insurance?",
-                "We offer self-pay rates, an in-house membership plan, and financing options through "
-                "third-party providers. Ask us about our Bright Smile Membership for significant savings "
-                "on cleanings, exams, and X-rays.",
+                "You can pay as you go: a routine cleaning is $140 self-pay. Our Bright Smile Membership is "
+                "$399 per year and includes 2 cleanings, 2 exams, 1 set of X-rays, and 10% off other "
+                "treatment. For larger plans, PayBright offers 0% interest for 6 months on amounts over "
+                "$500 (subject to credit approval).",
             ),
             (
                 "payment",
                 3,
                 "What payment methods do you accept?",
-                "We accept Visa, Mastercard, American Express, Interac Debit, cash, and direct insurance "
-                "billing. Financing is available through PayBright for larger treatment plans.",
+                "We take Visa, Mastercard, Amex, Interac debit, cash, and direct insurance billing. "
+                "Example self-pay: cleaning $140. Membership: $399/year. PayBright financing on plans "
+                "over $500: 0% for 6 months where approved.",
             ),
             (
                 "hours",
@@ -629,9 +631,10 @@ def seed() -> None:
                 "new_patient",
                 9,
                 "How do I register as a new patient?",
-                "You can register through our chatbot by selecting 'New Patient', or call us at "
-                "(416) 555-0100. We will ask for basic contact information, date of birth, and "
-                "insurance details if applicable.",
+                "You can register right here in this chat — I will walk you through it step by step "
+                "(name, phone, date of birth, insurance if any, and what kind of visit you need). "
+                "If you would rather talk to someone, you can always try calling us another time. "
+                "Would you like to register now?",
             ),
         ]
         for category, sort_order, question, answer in faq_data:
@@ -657,7 +660,10 @@ def seed() -> None:
                     location_id=location.id,
                     name="Self-Pay Cleaning",
                     pricing_type="self_pay",
-                    description="Standard teeth cleaning without insurance. Includes scaling and polishing.",
+                    description=(
+                        "Routine adult cleaning (scaling and polishing), uninsured. "
+                        "New patient exam and X-rays if needed: typically $95–$180 depending on imaging."
+                    ),
                     base_price=140.00,
                     is_active=True,
                 ),
@@ -667,7 +673,8 @@ def seed() -> None:
                     name="Bright Smile Membership",
                     pricing_type="membership",
                     description=(
-                        "Annual membership: 2 cleanings, 2 exams, 1 set of X-rays, 10% off all additional treatments."
+                        "$399/year: includes 2 cleanings ($140 value each), 2 exams ($95 each), "
+                        "1 set of bitewing X-rays ($45), plus 10% off fillings and other treatment."
                     ),
                     base_price=399.00,
                     is_active=True,
@@ -678,8 +685,8 @@ def seed() -> None:
                     name="PayBright Financing",
                     pricing_type="financing",
                     description=(
-                        "0% interest for 6 months on treatment plans over $500 through PayBright. "
-                        "Subject to credit approval."
+                        "Split larger balances: 0% APR for 6 months on approved plans over $500 "
+                        "(example: $1,200 treatment ≈ $200/month for 6 months). Subject to credit approval."
                     ),
                     base_price=None,
                     is_active=True,

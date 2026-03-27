@@ -155,7 +155,7 @@ FIELDS: dict[str, FieldDef] = {
     "preferred_date_from": FieldDef(
         key="preferred_date_from",
         display_name="preferred date",
-        prompt="When works best for you?",
+        prompt="When would you like your appointment?",
         description=(
             "The patient's preferred appointment date or time-frame. "
             "Return an ISO date (YYYY-MM-DD) for exact dates, or a natural phrase "
@@ -258,6 +258,9 @@ class WorkflowDef:
     # Message shown once all fields are collected (just before confirmation/tool call).
     ready_message: str = ""
 
+    # Per-workflow overrides for field prompts (field_key → custom prompt).
+    prompt_overrides: dict[str, str] = field(default_factory=dict)
+
     # If this workflow needs patient identity verified first, set this to
     # EXISTING_PATIENT_VERIFICATION; the machine will run it as a sub-workflow.
     requires_patient_id: bool = False
@@ -292,7 +295,7 @@ WORKFLOWS: dict[Workflow, WorkflowDef] = {
         optional_fields=["preferred_time_of_day"],
         tool_name="create_patient",
         requires_confirmation=True,
-        greeting="Great, I can get you set up right now! What's your full name?",
+        greeting="Great, I can get you set up right now!",
         ready_message="Awesome, I've got everything I need. Just want to confirm before I go ahead:",
     ),
     # ------------------------------------------------------------------
@@ -304,8 +307,9 @@ WORKFLOWS: dict[Workflow, WorkflowDef] = {
         required_fields=["first_name", "last_name", "phone_number"],
         optional_fields=["email"],
         tool_name="lookup_patient",
-        greeting="Sure! To find your file, what's your full name and phone number?",
+        greeting="Sure! Let me pull up your file.",
         ready_message="Perfect, give me one sec to look you up!",
+        prompt_overrides={"phone_number": "What's your phone number?"},
     ),
     # ------------------------------------------------------------------
     # Book appointment (existing patient)

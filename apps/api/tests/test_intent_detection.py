@@ -177,3 +177,50 @@ class TestMidWorkflowGuard:
         state = WorkflowState(workflow=Workflow.NEW_PATIENT_REGISTRATION, step="collecting")
         result = detect_intent("cancel everything", state)
         assert result == Workflow.GENERAL_INQUIRY
+
+    def test_emergency_escapes_mid_flow(self):
+        from state_machine.machine import detect_intent
+        state = WorkflowState(workflow=Workflow.BOOK_APPOINTMENT, step="collecting")
+        result = detect_intent("I have severe pain, this is an emergency", state)
+        assert result == Workflow.EMERGENCY_TRIAGE
+
+    def test_actually_cancel_escapes(self):
+        from state_machine.machine import detect_intent
+        state = WorkflowState(workflow=Workflow.BOOK_APPOINTMENT, step="collecting")
+        result = detect_intent("actually i want to cancel my appointment", state)
+        assert result == Workflow.CANCEL_APPOINTMENT
+
+    def test_speak_to_someone_escapes(self):
+        from state_machine.machine import detect_intent
+        state = WorkflowState(workflow=Workflow.BOOK_APPOINTMENT, step="collecting")
+        result = detect_intent("speak to someone", state)
+        assert result == Workflow.HANDOFF
+
+    def test_failed_lookup_yes_routes_to_registration(self):
+        from state_machine.machine import detect_intent
+        state = WorkflowState(
+            workflow=Workflow.EXISTING_PATIENT_VERIFICATION,
+            step="collecting",
+            collected_fields={"_lookup_failed_offer_registration": True},
+        )
+        result = detect_intent("yes please", state)
+        assert result == Workflow.NEW_PATIENT_REGISTRATION
+
+    def test_failed_lookup_register_routes_to_registration(self):
+        from state_machine.machine import detect_intent
+        state = WorkflowState(
+            workflow=Workflow.EXISTING_PATIENT_VERIFICATION,
+            step="collecting",
+            collected_fields={"_lookup_failed_offer_registration": True},
+        )
+        result = detect_intent("I'd like to register as a new patient", state)
+        assert result == Workflow.NEW_PATIENT_REGISTRATION
+
+    def test_no_registration_escape_without_flag(self):
+        from state_machine.machine import detect_intent
+        state = WorkflowState(
+            workflow=Workflow.EXISTING_PATIENT_VERIFICATION,
+            step="collecting",
+        )
+        result = detect_intent("yes please", state)
+        assert result == Workflow.EXISTING_PATIENT_VERIFICATION

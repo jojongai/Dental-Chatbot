@@ -104,7 +104,7 @@ const SMSInputBar = ({ onSend, disabled }: SMSInputBarProps) => {
               inputText ? "text-foreground" : "text-muted-foreground"
             }`}
           >
-            {inputText || (disabled ? "Conversation ended" : "Text Message")}
+            {inputText || "Text Message"}
           </span>
           {!disabled && (
             <span className="inline-block w-[2px] h-[16px] bg-primary ml-[1px] animate-pulse" />

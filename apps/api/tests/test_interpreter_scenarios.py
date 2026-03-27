@@ -411,6 +411,34 @@ class TestFastPath:
         )
         assert _needs_llm(inp) is False
 
+    def test_verify_identity_with_identity_hints_skips_llm(self):
+        """
+        Production path: verify_identity WITH identity hints must skip LLM.
+
+        When the user says "I'd like to book an appointment" and we pivot to
+        EXISTING_PATIENT_VERIFICATION, identity field hints (first_name, last_name,
+        phone_number) are populated.  Without Rule 5, Rule 4 doesn't fire (hints
+        exist) → LLM runs → returns SWITCH→book_appointment → infinite recursion.
+        """
+        from llm.interpreter import _needs_llm
+        inp = _make_input(
+            "I'd like to book an appointment",
+            workflow="existing_patient_verification",
+            step="verify_identity",
+            missing_keys=["first_name", "last_name", "phone_number"],
+        )
+        assert _needs_llm(inp) is False
+
+    def test_awaiting_patient_type_skips_llm(self):
+        """awaiting_patient_type step → keyword parser only, never LLM."""
+        from llm.interpreter import _needs_llm
+        inp = _make_input(
+            "I'm an existing patient",
+            step="awaiting_patient_type",
+            missing_keys=[],
+        )
+        assert _needs_llm(inp) is False
+
     # ------------------------------------------------------------------
     # _needs_llm() — should return True (use LLM)
     # ------------------------------------------------------------------

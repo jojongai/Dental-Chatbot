@@ -195,6 +195,39 @@ def _safe_date(year: int, month: int, day: int) -> date | None:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Booking patient-type gate — "new or existing patient?"
+# ---------------------------------------------------------------------------
+
+
+def parse_booking_patient_type(text: str) -> str | None:
+    """
+    Classify user reply as 'new' or 'existing' when asked
+    "Are you a new or existing patient?"
+
+    Returns 'new', 'existing', or None (unclear).
+    """
+    lower = text.strip().lower()
+    _new = [
+        "new", "first time", "first visit", "never been", "never visited",
+        "haven't been", "havent been", "register", "sign up", "not yet",
+        "never before",
+    ]
+    _existing = [
+        "existing", "returning", "been before", "been here before",
+        "current patient", "already a patient", "come here",
+        "i've been", "ive been", "been there", "have been",
+        "yes i am", "yes i'm", "yes im",
+    ]
+    for phrase in _existing:
+        if phrase in lower:
+            return "existing"
+    for phrase in _new:
+        if phrase in lower:
+            return "new"
+    return None
+
+
 # ===========================================================================
 # SEMANTIC FALLBACK EXTRACTORS
 #
@@ -347,8 +380,39 @@ def extract_preferred_date(text: str, today: date | None = None) -> date | None:
         return ref + timedelta(days=days_until_next_mon)
     if "this week" in lower:
         return ref
+    # "first day of next month", "beginning of next month"
+    if re.search(r"(first day|start|beginning)\s+of\s+next\s+month", lower):
+        next_m = ref.month + 1 if ref.month < 12 else 1
+        next_y = ref.year if ref.month < 12 else ref.year + 1
+        return date(next_y, next_m, 1)
+    # "end of next month", "last day of next month"
+    if re.search(r"(end|last day)\s+of\s+next\s+month", lower):
+        next_m = ref.month + 1 if ref.month < 12 else 1
+        next_y = ref.year if ref.month < 12 else ref.year + 1
+        after = next_m + 1 if next_m < 12 else 1
+        after_y = next_y if next_m < 12 else next_y + 1
+        return date(after_y, after, 1) - timedelta(days=1)
+    # "first day of April", "beginning of May"
+    m = re.search(r"(?:first day|start|beginning)\s+of\s+([A-Za-z]+)", lower)
+    if m and m.group(1) in _MONTHS:
+        month = _MONTHS[m.group(1)]
+        candidate = date(ref.year, month, 1)
+        return candidate if candidate >= ref else date(ref.year + 1, month, 1)
+    # "end of April", "last day of March"
+    m = re.search(r"(?:end|last day)\s+of\s+([A-Za-z]+)", lower)
+    if m and m.group(1) in _MONTHS:
+        month = _MONTHS[m.group(1)]
+        next_m = month + 1 if month < 12 else 1
+        next_y = ref.year if month < 12 else ref.year + 1
+        candidate = date(next_y, next_m, 1) - timedelta(days=1)
+        if candidate.month != month:
+            candidate = date(ref.year, month, 1)
+        return candidate if candidate >= ref else date(ref.year + 1, month, candidate.day)
+    # "next month" (generic) → 1st of next month
     if "next month" in lower:
-        return ref + timedelta(days=30)
+        next_m = ref.month + 1 if ref.month < 12 else 1
+        next_y = ref.year if ref.month < 12 else ref.year + 1
+        return date(next_y, next_m, 1)
 
     for day_name, day_num in _WEEKDAY_MAP.items():
         if re.search(r"\b" + day_name + r"\b", lower):
@@ -357,7 +421,28 @@ def extract_preferred_date(text: str, today: date | None = None) -> date | None:
                 days_ahead = 7
             return ref + timedelta(days=days_ahead)
 
-    # Explicit date (re-use DOB parser — same date formats)
+    # "March 27" / "April 5th" — month name + day without year → assume this/next year
+    m = re.search(r"\b([A-Za-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?\b", lower)
+    if m and m.group(1) in _MONTHS:
+        month = _MONTHS[m.group(1)]
+        day = int(m.group(2))
+        candidate = _safe_date(ref.year, month, day)
+        if candidate:
+            return candidate if candidate >= ref else _safe_date(ref.year + 1, month, day) or candidate
+
+    # "the 27th" / "on the 15th" — bare ordinal day → assume current month or next
+    m = re.search(r"\b(?:the\s+)?(\d{1,2})(?:st|nd|rd|th)\b", lower)
+    if m:
+        day = int(m.group(1))
+        if 1 <= day <= 31:
+            candidate = _safe_date(ref.year, ref.month, day)
+            if candidate and candidate >= ref:
+                return candidate
+            next_m = ref.month + 1 if ref.month < 12 else 1
+            next_y = ref.year if ref.month < 12 else ref.year + 1
+            return _safe_date(next_y, next_m, day) or candidate
+
+    # Explicit date with year (re-use DOB parser — same date formats)
     return extract_dob(text)
 
 

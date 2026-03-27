@@ -110,6 +110,10 @@ class WorkflowState(BaseModel):
     appointment_id: str | None = None  # for reschedule / cancel flows
     family_group_id: str | None = None
 
+    # Last get_clinic_info category (hours, location, insurance, payment, …) for
+    # resolving short follow-ups like "yes" / "no" after Maya offered more detail.
+    last_clinic_category: str | None = None
+
     # Slot selection state — populated after search_slots returns options.
     # List of {"id": slot_id, "label": "Tuesday April 8, 10:00 AM - 11:00 AM"}
     slot_options: list[dict] = Field(default_factory=list)

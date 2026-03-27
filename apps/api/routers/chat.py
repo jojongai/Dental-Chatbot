@@ -99,6 +99,10 @@ async def post_chat(
     if current_state.step == "selecting_slot" and current_state.slot_options:
         return _handle_slot_selection(body.message, current_state, db, practice_id)
 
+    # --- no-slots retry: user wants to try a different date after search returned empty ---
+    if current_state.step == "no_slots_retry":
+        return _handle_no_slots_retry(body.message, current_state, db, practice_id)
+
     # --- disambiguation retry: two records matched → user replied with email ---
     if current_state.step == "disambiguating":
         current_state = _apply_verification_retry(current_state, body.message)
@@ -214,22 +218,36 @@ def _dispatch_tool(
                 from schemas.tools import GetClinicInfoInput
                 from tools.clinic_tools import get_clinic_info, get_pricing_options
 
-                category = _infer_clinic_category(original_message)
+                category, followup = _resolve_clinic_category_and_followup(
+                    original_message, state
+                )
+                question_hint = _build_clinic_question_hint(
+                    original_message, category, followup
+                )
+
                 result = get_clinic_info(
                     db,
-                    GetClinicInfoInput(category=category, question_hint=original_message),
+                    GetClinicInfoInput(category=category, question_hint=question_hint),
                     practice_id=practice_id,
                 )
                 pricing: list = []
-                if category in ("payment", "insurance") or _is_payment_question(original_message):
+                if category in ("payment", "insurance") or _is_payment_question(
+                    original_message
+                ):
                     pricing = get_pricing_options(db, practice_id=practice_id)
 
                 from llm.receptionist import answer_general_inquiry
 
                 reply = answer_general_inquiry(
-                    original_message, result, pricing or None, is_first_message=is_first_message
+                    original_message,
+                    result,
+                    pricing or None,
+                    is_first_message=is_first_message,
+                    inquiry_followup=followup,
+                    inquiry_category=category,
                 )
-                return reply, state, ["get_clinic_info"]
+                new_state = state.model_copy(update={"last_clinic_category": category})
+                return reply, new_state, ["get_clinic_info"]
 
             # ------------------------------------------------------------------
             # Patient lookup (existing-patient verification)
@@ -280,16 +298,19 @@ def _dispatch_tool(
                     "I wasn't able to find a record with that name and number. "
                     "Could you double-check, or would you like to register as a new patient?"
                 )
-                # Clear identity fields so the user can re-enter them
+                # Clear identity fields so the user can re-enter them;
+                # set flag so detect_intent allows routing to NEW_PATIENT_REGISTRATION.
+                retry_collected = {
+                    k: v
+                    for k, v in state.collected_fields.items()
+                    if not k.startswith("_")
+                    and k not in ("first_name", "last_name", "phone_number", "email")
+                }
+                retry_collected["_lookup_failed_offer_registration"] = True
                 retry_state = state.model_copy(
                     update={
                         "step": "collecting",
-                        "collected_fields": {
-                            k: v
-                            for k, v in state.collected_fields.items()
-                            if not k.startswith("_")
-                            and k not in ("first_name", "last_name", "phone_number", "email")
-                        },
+                        "collected_fields": retry_collected,
                         "missing_fields": ["first_name", "last_name", "phone_number"],
                     }
                 )
@@ -304,6 +325,32 @@ def _dispatch_tool(
 
                 result = create_patient(db, CreatePatientInput(**tool_input_data), practice_id=practice_id)
                 if not result.success or not result.patient:
+                    already_exists = result.error and "already exists" in result.error.lower()
+                    if already_exists:
+                        from schemas.tools import LookupPatientInput
+                        from tools.patient_tools import lookup_patient
+
+                        lookup_fields = ["first_name", "last_name", "phone_number"]
+                        lookup_result = lookup_patient(
+                            db,
+                            LookupPatientInput(**_safe_input(tool_input_data, lookup_fields)),
+                            practice_id=practice_id,
+                        )
+                        if lookup_result.found and lookup_result.patient:
+                            p = lookup_result.patient
+                            verified_state = state.model_copy(update={"patient_id": p.id})
+                            reply, vs, resume_tools = _resume_pending_workflow(
+                                verified_state, db, p.first_name, tool_input_data
+                            )
+                            all_tools = list(dict.fromkeys(
+                                ["create_patient", "lookup_patient"] + resume_tools
+                            ))
+                            return (
+                                f"It looks like you're already in our system, {p.first_name}! "
+                                f"{reply}",
+                                vs,
+                                all_tools,
+                            )
                     return f"I couldn't register you: {result.error}", state, ["create_patient"]
 
                 # Store patient_id, then immediately search slots
@@ -409,13 +456,27 @@ def _resume_pending_workflow(
     pending = state.collected_fields.get("_pending_workflow", "")
 
     if pending == "book_appointment":
-        reply, new_state, tools = _search_and_present_slots(
-            tool_input_data,
-            state,
-            db,
-            preamble=f"Got it, welcome back {first_name}!",
+        from state_machine.definitions import WORKFLOWS, FIELDS
+        bk_def = WORKFLOWS[Workflow.BOOK_APPOINTMENT]
+        new_state = state.model_copy(
+            update={
+                "workflow": Workflow.BOOK_APPOINTMENT,
+                "step": "collecting",
+                "collected_fields": {
+                    k: v for k, v in state.collected_fields.items()
+                    if not k.startswith("_")
+                },
+                "missing_fields": list(bk_def.required_fields),
+            }
         )
-        return reply, new_state, ["lookup_patient"] + tools
+        first_field = bk_def.required_fields[0]
+        fd = FIELDS.get(first_field)
+        prompt = fd.prompt if fd else f"Could you provide your {first_field.replace('_', ' ')}?"
+        return (
+            f"Got it, welcome back {first_name}! {prompt}",
+            new_state,
+            ["lookup_patient"],
+        )
 
     if pending in ("reschedule_appointment", "cancel_appointment"):
         reply, new_state = _list_and_present_appointments(state, db, first_name)
@@ -600,7 +661,8 @@ def _search_and_present_slots(
             "I couldn't find any available slots in that period. "
             "Would you like to try a different date or time of day?"
         )
-        return reply.strip(), state, ["search_slots"]
+        retry_state = state.model_copy(update={"step": "no_slots_retry"})
+        return reply.strip(), retry_state, ["search_slots"]
 
     options = result.slots[:3]
     slot_options = [{"id": s.id, "label": f"{s.date_label}, {s.time_label}"} for s in options]
@@ -614,6 +676,44 @@ def _search_and_present_slots(
 
     new_state = state.model_copy(update={"step": "selecting_slot", "slot_options": slot_options})
     return reply.strip(), new_state, ["search_slots"]
+
+
+# ---------------------------------------------------------------------------
+# No-slots retry handler — user wants to try different dates after empty search
+# ---------------------------------------------------------------------------
+
+
+def _handle_no_slots_retry(
+    message: str,
+    state: WorkflowState,
+    db: Session,
+    practice_id: str,
+) -> ChatResponse:
+    """
+    Extract a new date/time preference from the user's reply and re-search.
+    If no new date is found, widen the search window automatically.
+    """
+    from state_machine.extractors import extract_preferred_date, extract_time_of_day
+
+    search_data = dict(state.collected_fields)
+    new_date = extract_preferred_date(message)
+    if new_date:
+        search_data["preferred_date_from"] = new_date
+    new_time = extract_time_of_day(message)
+    if new_time:
+        search_data["preferred_time_of_day"] = new_time
+
+    preamble = ""
+    if not new_date and not new_time:
+        from datetime import date as _date, timedelta
+        search_data["preferred_date_from"] = _date.today() + timedelta(days=1)
+        search_data.pop("preferred_time_of_day", None)
+        preamble = "Let me check what's available."
+
+    reply, new_state, tools = _search_and_present_slots(
+        search_data, state, db, preamble=preamble
+    )
+    return ChatResponse(reply=reply, state=new_state, tools_called=tools)
 
 
 # ---------------------------------------------------------------------------
@@ -771,7 +871,63 @@ _CATEGORY_KEYWORDS: dict[str, list[str]] = {
     "location": ["where", "address", "located", "location", "parking", "direction", "find you"],
     "insurance": ["insurance", "coverage", "plan", "benefit", "covered", "accept", "sun life", "manulife"],
     "payment": ["payment", "pay", "no insurance", "uninsured", "self pay", "self-pay", "financing", "membership", "afford"],
+    "new_patient": [
+        "new patient",
+        "register",
+        "registration",
+        "first visit",
+        "first time",
+        "sign up",
+        "how do i register",
+        "become a patient",
+    ],
 }
+
+
+def _resolve_clinic_category_and_followup(
+    message: str,
+    state: WorkflowState,
+) -> tuple[str | None, str | None]:
+    """
+    Infer FAQ category from the message, or treat short yes/no as follow-ups to
+    ``state.last_clinic_category`` (e.g. after \"Would you like more details?\").
+    Returns (category, followup) where followup is \"affirm\", \"negate\", or None.
+    """
+    from state_machine.extractors import extract_confirmation
+
+    category = _infer_clinic_category(message)
+    if category is not None:
+        return category, None
+
+    last = state.last_clinic_category
+    if not last:
+        return None, None
+
+    conf = extract_confirmation(message)
+    if conf is True:
+        return last, "affirm"
+    if conf is False:
+        return last, "negate"
+    return None, None
+
+
+def _build_clinic_question_hint(
+    message: str,
+    category: str | None,
+    followup: str | None,
+) -> str:
+    """Richer hint for FAQ ranking + receptionist when the user affirms/declines more detail."""
+    if not followup or not category:
+        return message
+    if followup == "affirm":
+        return (
+            f"{message} [Context: patient agreed they want more detail on {category} "
+            "(e.g. after being offered more details).]"
+        )
+    return (
+        f"{message} [Context: patient declined more detail on {category}. "
+        "Acknowledge and pivot; do not push.]"
+    )
 
 
 def _infer_clinic_category(message: str) -> str | None:

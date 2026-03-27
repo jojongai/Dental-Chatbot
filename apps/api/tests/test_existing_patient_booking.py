@@ -360,8 +360,8 @@ class TestDispatchLookupPatient:
         from routers.chat import _dispatch_tool
         return _dispatch_tool
 
-    def test_verified_with_pending_booking_triggers_slot_search(self, db: Session) -> None:
-        """Carol Williams verified → auto-searches slots (pending_workflow=book_appointment)."""
+    def test_verified_with_pending_booking_asks_appointment_details(self, db: Session) -> None:
+        """Carol Williams verified → asks for appointment type/date instead of auto-searching slots."""
         _dispatch_tool = self._import_dispatch()
         state = self._make_state()
         reply, new_state, tools = _dispatch_tool(
@@ -372,9 +372,9 @@ class TestDispatchLookupPatient:
             practice_id=PRACTICE_ID,
         )
         assert "welcome back" in reply.lower()
-        assert "search_slots" in tools
-        assert new_state.step == "selecting_slot"
-        assert len(new_state.slot_options) > 0
+        from schemas.chat import Workflow
+        assert new_state.workflow == Workflow.BOOK_APPOINTMENT
+        assert new_state.step == "collecting"
         assert new_state.patient_id == "pat3"
 
     def test_duplicate_returns_disambiguation_prompt(self, db: Session) -> None:
@@ -412,6 +412,7 @@ class TestDispatchLookupPatient:
         assert "last_name" not in new_state.collected_fields
         assert "phone_number" not in new_state.collected_fields
         assert new_state.step == "collecting"
+        assert new_state.collected_fields.get("_lookup_failed_offer_registration") is True
 
     def test_not_found_after_retry_gives_specific_message(self, db: Session) -> None:
         """Second failure (_lookup_retry=True) → 'still wasn't able' message."""

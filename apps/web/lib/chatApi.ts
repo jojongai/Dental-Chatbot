@@ -18,6 +18,8 @@ export interface WorkflowState {
   slot_options: { id: string; label: string }[];
   selected_slot_id: string | null;
   appointment_options: { id: string; label: string }[];
+  /** Last FAQ category (payment, hours, …) for yes/no follow-ups to "want more detail?" */
+  last_clinic_category?: string | null;
 }
 
 // ── Request / Response shapes ───────────────────────────────────────────────

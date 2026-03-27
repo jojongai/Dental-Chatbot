@@ -52,6 +52,15 @@ logger = logging.getLogger(__name__)
 # These are too structurally strict for the LLM to handle reliably.
 _DETERMINISTIC_FIELDS = frozenset({"phone_number", "date_of_birth", "email"})
 
+# Workflows that need the "Are you a new or existing patient?" question
+# before pivoting to verification or new-patient registration.
+_PATIENT_TYPE_GATED = frozenset({
+    Workflow.BOOK_APPOINTMENT,
+    Workflow.RESCHEDULE_APPOINTMENT,
+    Workflow.CANCEL_APPOINTMENT,
+    Workflow.FAMILY_BOOKING,
+})
+
 # ---------------------------------------------------------------------------
 # Emergency safety guardrail — deterministic, runs before the LLM
 # ---------------------------------------------------------------------------
@@ -121,16 +130,74 @@ def detect_intent(message: str, current: WorkflowState) -> Workflow:
     For new conversations (workflow == GENERAL_INQUIRY) intent classification
     is delegated to llm/intent.py, which uses Gemini when USE_LLM=true and
     falls back to keyword matching otherwise.
+
+    After new-patient FAQ (``last_clinic_category == \"new_patient\"``), a reply to
+    \"Would you like to register now?\" is interpreted via ``interpret_registration_followup``
+    (LLM when USE_LLM=true; keyword confirmation fallback when not).
     """
     if current.workflow not in (Workflow.GENERAL_INQUIRY,):
         lower = message.lower()
+
+        # Explicit reset phrases → back to general inquiry
         if any(k in lower for k in ("start over", "cancel everything", "different question")):
             return Workflow.GENERAL_INQUIRY
+
+        # After a failed lookup the bot offers "would you like to register?"
+        if current.collected_fields.get("_lookup_failed_offer_registration"):
+            _reg_phrases = ("register", "new patient", "sign up", "yes", "yeah", "yep", "sure", "ok", "okay")
+            if any(p in lower for p in _reg_phrases):
+                return Workflow.NEW_PATIENT_REGISTRATION
+
+        # Allow mid-flow workflow switches for clear intent changes.
+        # Emergency always takes priority (the guardrail in process() also handles this,
+        # but we let detect_intent cooperate so the flow is clean).
+        if _is_emergency(lower) and current.workflow != Workflow.EMERGENCY_TRIAGE:
+            return Workflow.EMERGENCY_TRIAGE
+
+        # "Actually I want to X instead" — clear verbal pivot
+        _MIDFLOW_OVERRIDES = (
+            ("actually i want to cancel", Workflow.CANCEL_APPOINTMENT),
+            ("actually cancel", Workflow.CANCEL_APPOINTMENT),
+            ("i need to cancel instead", Workflow.CANCEL_APPOINTMENT),
+            ("actually i want to reschedule", Workflow.RESCHEDULE_APPOINTMENT),
+            ("actually reschedule", Workflow.RESCHEDULE_APPOINTMENT),
+            ("i need to reschedule instead", Workflow.RESCHEDULE_APPOINTMENT),
+            ("actually i want to book", Workflow.BOOK_APPOINTMENT),
+            ("actually book", Workflow.BOOK_APPOINTMENT),
+            ("speak to someone", Workflow.HANDOFF),
+            ("talk to a person", Workflow.HANDOFF),
+            ("talk to someone", Workflow.HANDOFF),
+            ("speak to a human", Workflow.HANDOFF),
+        )
+        for phrase, target in _MIDFLOW_OVERRIDES:
+            if phrase in lower and current.workflow != target:
+                return target
+
         return current.workflow  # stay in current workflow
+
+    if current.last_clinic_category == "new_patient":
+        from llm.interpreter import interpret_registration_followup
+
+        out = interpret_registration_followup(message)
+        if _registration_followup_agrees_to_register(out):
+            return Workflow.NEW_PATIENT_REGISTRATION
 
     from llm.intent import classify_intent
 
     return classify_intent(message)
+
+
+def _registration_followup_agrees_to_register(out: Any) -> bool:
+    """True when the interpreter says the patient agreed to start new-patient registration."""
+    pi = (out.primary_intent or "").strip().lower().replace("-", "_")
+    conf = float(out.confidence or 0)
+    if pi == "general_inquiry":
+        return False
+    if pi == "new_patient_registration" and conf >= 0.45:
+        return True
+    if out.extracted_fields.get("confirmation") is True and pi in ("new_patient_registration", ""):
+        return conf >= 0.45
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -146,11 +213,20 @@ class WorkflowStateMachine:
     # Main entry point
     # ------------------------------------------------------------------
 
-    def process(self, message: str) -> MachineResult:
+    _MAX_RECURSION_DEPTH = 3
+
+    def process(self, message: str, _depth: int = 0) -> MachineResult:
         """
         Process one user message turn.
         Returns a MachineResult describing what to reply and whether a tool is ready.
         """
+        if _depth >= self._MAX_RECURSION_DEPTH:
+            logger.error("process() recursion depth exceeded (%d); returning safe fallback", _depth)
+            return MachineResult(
+                state=self.state,
+                reply="Something went wrong on our end. Please try again or call (416) 555-0100.",
+            )
+
         # 1. Emergency safety guardrail — deterministic, runs before everything else.
         #    Fires on obvious safety phrases regardless of LLM classification.
         if (
@@ -166,10 +242,34 @@ class WorkflowStateMachine:
                     "missing_fields": [],
                 }
             )
-            return self.process(message)
+            return self.process(message, _depth=_depth + 1)
 
         # 2. Detect / confirm workflow (opening turn or mid-flow guard)
+        original_workflow = self.state.workflow
         workflow = detect_intent(message, self.state)
+        wf_def = WORKFLOWS[workflow]
+
+        # 2a. Workflow sync: if detect_intent returned a different workflow
+        #     (e.g. failed-lookup → NEW_PATIENT_REGISTRATION), reset state.
+        if workflow != self.state.workflow and self.state.workflow != Workflow.GENERAL_INQUIRY:
+            self.state = self.state.model_copy(
+                update={
+                    "workflow": workflow,
+                    "step": "start",
+                    "collected_fields": _strip_identity_for_new_registration(self.state.collected_fields)
+                    if workflow == Workflow.NEW_PATIENT_REGISTRATION
+                    else _carry_forward_fields(self.state.collected_fields),
+                    "missing_fields": [],
+                }
+            )
+
+        # 2b. Patient-type gate: ask "new or existing?" before verification pivot.
+        #     Also handles returning from the gate when step == awaiting_patient_type.
+        gate_result = self._patient_type_gate(message, workflow, wf_def)
+        if gate_result is not None:
+            return gate_result
+        # After the gate, workflow/wf_def may have been updated by the gate.
+        workflow = self.state.workflow if self.state.step == "verify_identity" else workflow
         wf_def = WORKFLOWS[workflow]
 
         # Handle sub-workflow: if this workflow needs patient_id and we don't have one,
@@ -191,7 +291,9 @@ class WorkflowStateMachine:
             self.state = new_state
 
         # 3. First turn: set workflow and step
-        is_first_turn = self.state.workflow == Workflow.GENERAL_INQUIRY and workflow != Workflow.GENERAL_INQUIRY
+        #    Use original_workflow (captured before pivot) so the greeting fires
+        #    even when the pivot already changed self.state.workflow.
+        is_first_turn = original_workflow == Workflow.GENERAL_INQUIRY and workflow != Workflow.GENERAL_INQUIRY
         if is_first_turn or self.state.step == "start":
             self.state = self.state.model_copy(
                 update={
@@ -235,7 +337,7 @@ class WorkflowStateMachine:
                             "missing_fields": [],
                         }
                     )
-                    return self.process(message)
+                    return self.process(message, _depth=_depth + 1)
 
         elif interp.workflow_transition == WorkflowTransition.BRANCH:
             logger.info(
@@ -259,7 +361,7 @@ class WorkflowStateMachine:
                     "missing_fields": [],
                 }
             )
-            return self.process(message)
+            return self.process(message, _depth=_depth + 1)
 
         # 8. Compute what's still missing
         missing = self._compute_missing(wf_def)
@@ -342,13 +444,19 @@ class WorkflowStateMachine:
 
         # Merge fields from interpreter (semantic fields)
         for k, v in interp.extracted_fields.items():
-            if k not in collected and v is not None:
-                # first_name interpreter result may be a plain string — handle multi_key
-                fd = FIELDS.get(k)
-                if fd and fd.multi_key and isinstance(v, dict):
-                    collected.update(v)
-                else:
-                    collected[k] = v
+            if v is None:
+                continue
+            fd = FIELDS.get(k)
+            if fd and fd.multi_key and isinstance(v, dict):
+                # Multi-key field (e.g. first_name → {first_name, last_name}).
+                # Merge individual sub-keys that are still missing so that
+                # providing last_name still works when first_name is already set.
+                for sub_k, sub_v in v.items():
+                    if sub_k not in collected and sub_v is not None:
+                        collected[sub_k] = sub_v
+                        logger.debug("Interpreter extracted %r = %r (multi_key)", sub_k, sub_v)
+            elif k not in collected:
+                collected[k] = v
                 logger.debug("Interpreter extracted %r = %r", k, v)
 
         # Deterministic override: regex is authoritative for phone, DOB, email
@@ -364,16 +472,27 @@ class WorkflowStateMachine:
                 except Exception:
                     pass
 
+        # Resolve preferred_date_from: the LLM often returns raw text ("next week",
+        # "tomorrow") instead of a date object — run the regex extractor to convert.
+        pdf = collected.get("preferred_date_from")
+        if isinstance(pdf, str):
+            from state_machine.extractors import extract_preferred_date
+            parsed = extract_preferred_date(pdf)
+            if parsed is not None:
+                collected["preferred_date_from"] = parsed
+
         # Always attempt name extraction via deterministic regex (useful when
-        # the user provides name + phone in the same message)
+        # the user provides name + phone in the same message, or when
+        # first_name is set but last_name is still missing).
         if "first_name" not in collected or "last_name" not in collected:
             fd = FIELDS.get("first_name")
             if fd and fd.extractor:
                 try:
                     val = fd.extractor(message)  # type: ignore[call-arg]
                     if val is not None and isinstance(val, dict):
-                        if "first_name" not in collected:
-                            collected.update(val)
+                        for sub_k, sub_v in val.items():
+                            if sub_k not in collected and sub_v is not None:
+                                collected[sub_k] = sub_v
                 except Exception:
                     pass
 
@@ -409,12 +528,43 @@ class WorkflowStateMachine:
     # Reply builders
     # ------------------------------------------------------------------
 
+    _REASK_HINTS: dict[str, str] = {
+        "phone_number": (
+            "That doesn't look like a valid phone number. "
+            "Please enter a 10-digit number, e.g. 416-555-1234."
+        ),
+        "date_of_birth": (
+            "I couldn't read that date. "
+            "Try a format like March 14, 1990 or 03/14/1990."
+        ),
+        "preferred_date_from": (
+            "I couldn't read that date. "
+            "Try something like next Monday, April 5, or tomorrow."
+        ),
+        "email": (
+            "That doesn't look like a valid email. "
+            "Please enter an address like name@example.com."
+        ),
+    }
+
     def _ask_next_field(self, next_field: str, wf_def: WorkflowDef, is_first_turn: bool) -> MachineResult:
         field_def = FIELDS.get(next_field)
-        prompt = field_def.prompt if field_def else f"Could you provide your {next_field.replace('_', ' ')}?"
+        prompt = (
+            wf_def.prompt_overrides.get(next_field)
+            or (field_def.prompt if field_def else f"Could you provide your {next_field.replace('_', ' ')}?")
+        )
+
+        is_reask = self.state.step == f"collecting:{next_field}"
+        if is_reask and not is_first_turn:
+            hint = self._REASK_HINTS.get(next_field)
+            if hint:
+                prompt = hint
 
         if is_first_turn and wf_def.greeting:
-            reply = f"{wf_def.greeting}\n\n{prompt}"
+            if wf_def.greeting.rstrip().endswith("?"):
+                reply = wf_def.greeting
+            else:
+                reply = f"{wf_def.greeting}\n\n{prompt}"
         else:
             reply = prompt
 
@@ -547,6 +697,94 @@ class WorkflowStateMachine:
             "requires_patient_id": wf_def.requires_patient_id,
         }
 
+    # ------------------------------------------------------------------
+    # Patient-type gate
+    # ------------------------------------------------------------------
+
+    def _patient_type_gate(
+        self, message: str, workflow: Workflow, wf_def: WorkflowDef
+    ) -> MachineResult | None:
+        """
+        Ask "Are you a new or existing patient?" for booking-related workflows
+        before pivoting to verification or new-patient registration.
+
+        Returns a MachineResult when the gate handles the turn (either asking
+        the question or processing the answer).  Returns None when the gate
+        does not apply and process() should continue normally.
+        """
+        from state_machine.extractors import parse_booking_patient_type
+
+        # --- Entry: first time hitting a gated workflow without patient_id ---
+        if (
+            workflow in _PATIENT_TYPE_GATED
+            and not self.state.patient_id
+            and self.state.step not in ("awaiting_patient_type", "verify_identity")
+            and self.state.workflow != workflow  # only on fresh intent, not mid-flow
+        ):
+            self.state = self.state.model_copy(
+                update={
+                    "workflow": workflow,
+                    "step": "awaiting_patient_type",
+                    "collected_fields": {
+                        **self.state.collected_fields,
+                        "_pending_workflow": workflow.value,
+                    },
+                    "missing_fields": [],
+                }
+            )
+            return MachineResult(
+                state=self.state,
+                reply=(
+                    "Sure, I can help with that! Before we get started "
+                    "— are you a new or existing patient?"
+                ),
+                actions=[ChatAction(type=ActionType.REQUEST_INFO, payload={"field": "patient_type"})],
+                debug=self._debug_snapshot(wf_def),
+            )
+
+        # --- Reply: user answered the "new or existing?" question ---
+        if self.state.step == "awaiting_patient_type":
+            patient_type = parse_booking_patient_type(message)
+
+            if patient_type == "new":
+                self.state = self.state.model_copy(
+                    update={
+                        "workflow": Workflow.NEW_PATIENT_REGISTRATION,
+                        "step": "collecting",
+                        "collected_fields": _strip_identity_for_new_registration(
+                            self.state.collected_fields
+                        ),
+                        "missing_fields": list(WORKFLOWS[Workflow.NEW_PATIENT_REGISTRATION].required_fields),
+                    }
+                )
+                new_wf_def = WORKFLOWS[Workflow.NEW_PATIENT_REGISTRATION]
+                missing = self._compute_missing(new_wf_def)
+                return self._ask_next_field(missing[0], new_wf_def, is_first_turn=True)
+
+            if patient_type == "existing":
+                self.state = self.state.model_copy(
+                    update={
+                        "workflow": Workflow.EXISTING_PATIENT_VERIFICATION,
+                        "step": "verify_identity",
+                        "missing_fields": list(
+                            WORKFLOWS[Workflow.EXISTING_PATIENT_VERIFICATION].required_fields
+                        ),
+                    }
+                )
+                ver_wf_def = WORKFLOWS[Workflow.EXISTING_PATIENT_VERIFICATION]
+                missing = self._compute_missing(ver_wf_def)
+                return self._ask_next_field(missing[0], ver_wf_def, is_first_turn=True)
+
+            # Unclear reply — ask again
+            return MachineResult(
+                state=self.state,
+                reply="Sorry, I didn't catch that — are you a new patient or have you been here before?",
+                actions=[ChatAction(type=ActionType.REQUEST_INFO, payload={"field": "patient_type"})],
+                debug=self._debug_snapshot(wf_def),
+            )
+
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -566,15 +804,35 @@ def _carry_forward_fields(collected: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in collected.items() if k in keep}
 
 
+def _strip_identity_for_new_registration(collected: dict[str, Any]) -> dict[str, Any]:
+    """Remove identity + internal keys when switching from failed lookup to new-patient registration."""
+    drop = {"first_name", "last_name", "phone_number", "email"}
+    return {k: v for k, v in collected.items() if k not in drop and not k.startswith("_")}
+
+
+_NEGATION_PREFIXES = ("not ", "no ", "isn't ", "isnt ", "isn't ", "not an ", "no need", "don't ", "dont ")
+
+
 def _is_emergency(message: str) -> bool:
     """
     Deterministic guardrail that fires on obvious safety-related phrases.
     Intentionally conservative — only phrases that unambiguously signal a
     dental emergency or safety concern.  Runs before the LLM so that no
     urgent patient is ever misrouted by an incorrect LLM classification.
+
+    Ignores negated phrases like "not urgent", "not an emergency".
     """
     lower = message.lower()
-    return any(phrase in lower for phrase in _EMERGENCY_PHRASES)
+    for phrase in _EMERGENCY_PHRASES:
+        idx = lower.find(phrase)
+        if idx == -1:
+            continue
+        # Check for a negation word immediately before the matched phrase
+        prefix = lower[:idx].rstrip()
+        if any(prefix.endswith(neg.rstrip()) for neg in _NEGATION_PREFIXES):
+            continue
+        return True
+    return False
 
 
 def _log_interpreter_turn(

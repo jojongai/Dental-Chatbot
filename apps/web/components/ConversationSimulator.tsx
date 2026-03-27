@@ -36,6 +36,8 @@ const ConversationSimulator = () => {
   const newConversationFirstSend = useRef(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const msgCounter = useRef(0);
+  /** Set after mount so SSR HTML matches first client paint (avoids hydration mismatch). */
+  const [threadTime, setThreadTime] = useState<string | null>(null);
 
   const nextId = () => {
     msgCounter.current += 1;
@@ -51,6 +53,12 @@ const ConversationSimulator = () => {
   useEffect(() => {
     scrollToBottom();
   }, [messages, isTyping, scrollToBottom]);
+
+  useEffect(() => {
+    setThreadTime(
+      new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+    );
+  }, []);
 
   // ── API call helper ──────────────────────────────────────────────────────
 
@@ -168,7 +176,7 @@ const ConversationSimulator = () => {
           }
         >
           <div className="text-center text-[10px] text-sms-timestamp font-medium mb-2">
-            Today {new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+            Today{threadTime != null ? ` ${threadTime}` : ""}
           </div>
 
           {messages.map((msg) => (
