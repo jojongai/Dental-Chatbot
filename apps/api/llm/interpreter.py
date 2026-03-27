@@ -165,6 +165,10 @@ def _needs_llm(inp: InterpreterInput) -> bool:
     """
     m = inp.message.strip()
 
+    # Open-ended replies to proposed family slots — prefer LLM over yes/no regex.
+    if inp.step == "awaiting_family_slot_confirmation":
+        return True
+
     # Rule 1 — pending field is deterministic
     if inp.pending_field in _STRUCTURAL_FIELDS:
         return False
@@ -405,6 +409,21 @@ def _build_user_prompt(inp: InterpreterInput) -> str:
             "You may set extracted_fields.confirmation to true/false when the reply is clearly yes or no."
         )
 
+    if inp.step == "awaiting_family_slot_confirmation":
+        lines.append(
+            "\nSPECIAL CONTEXT — family appointment times just proposed:\n"
+            "Maya listed specific date and time windows for each family member (one appointment each).\n"
+            "The patient may agree in many natural ways (e.g. go ahead, book it, those work, perfect, "
+            "sounds good, let's do it, lock it in, that works for us).\n"
+            "They may push back or ask to change (e.g. too late in the day, need mornings, different day, "
+            "can't do that Friday, let me think, not those times).\n"
+            "Set extracted_fields.confirmation to true if they are accepting these proposed times and "
+            "want you to reserve them.\n"
+            "Set extracted_fields.confirmation to false if they want different times/dates or are "
+            "clearly not ready to book these slots.\n"
+            "If the message is unrelated or too ambiguous to tell, omit confirmation (do not guess)."
+        )
+
     if inp.pending_field and inp.pending_question:
         lines.append(f'Last question asked: "{inp.pending_question}" (asking for: {inp.pending_field})')
     elif inp.pending_field:
@@ -581,6 +600,36 @@ def _keyword_interpret(inp: InterpreterInput) -> InterpreterOutput:
         "group_preference": extract_group_preference,
         "family_count": extract_family_count,
     }
+
+    if inp.step == "awaiting_family_slot_confirmation":
+        c = extract_confirmation(inp.message)
+        transition = _detect_transition(inp.message, inp.workflow)
+        if c is True:
+            return InterpreterOutput(
+                primary_intent=None,
+                workflow_transition=transition,
+                confidence=0.85,
+                is_answering_pending_question=True,
+                extracted_fields={"confirmation": True},
+                answered_fields=["confirmation"],
+                uncertain_fields=[],
+                should_escalate=False,
+                suggested_next_action=None,
+                reasoning_summary="keyword fallback: affirmative to proposed family slots",
+            )
+        if c is False:
+            return InterpreterOutput(
+                primary_intent=None,
+                workflow_transition=transition,
+                confidence=0.85,
+                is_answering_pending_question=True,
+                extracted_fields={"confirmation": False},
+                answered_fields=["confirmation"],
+                uncertain_fields=[],
+                should_escalate=False,
+                suggested_next_action=None,
+                reasoning_summary="keyword fallback: wants different times or declined",
+            )
 
     extracted: dict[str, Any] = {}
     answered: list[str] = []

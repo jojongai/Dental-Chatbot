@@ -451,16 +451,17 @@ class TestFamilyBooking:
         assert result.state.step == "awaiting_patient_type"
         assert result.state.collected_fields.get("_pending_workflow") == Workflow.FAMILY_BOOKING.value
 
-    def test_required_fields(self):
+    def test_required_fields_are_custom_not_linear(self):
+        """Family booking uses family_booking.py — not WorkflowDef.required_fields."""
         wf = WORKFLOWS[Workflow.FAMILY_BOOKING]
-        assert "family_count" in wf.required_fields
-        assert "appointment_type" in wf.required_fields
-        assert "preferred_date_from" in wf.required_fields
+        assert wf.required_fields == []
 
-    def test_extracts_family_count(self):
+    def test_extracts_family_count_then_prompts_first_member(self):
         state = make_state(workflow=Workflow.FAMILY_BOOKING, step="collecting", patient_id="p1")
         result = run(state, "There are three of us")
         assert result.state.collected_fields.get("family_count") == 3
+        assert result.state.step == "family:member:0:name"
+        assert "Family member 1 of 3" in result.reply
 
     def test_tool_name_is_family_booking(self):
         assert WORKFLOWS[Workflow.FAMILY_BOOKING].tool_name == "book_family_appointments"

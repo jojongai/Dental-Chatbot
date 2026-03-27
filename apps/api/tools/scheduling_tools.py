@@ -391,17 +391,12 @@ def cancel_appointment(db: Session, payload: CancelAppointmentInput) -> CancelAp
 # ---------------------------------------------------------------------------
 
 
-def book_family_appointments(db: Session, payload: BookFamilyAppointmentsInput) -> BookFamilyAppointmentsOutput:
+def assign_family_appointment_slots(
+    db: Session, payload: BookFamilyAppointmentsInput
+) -> tuple[list[tuple[AppointmentSlot, AppointmentType, FamilyBookingMemberIn]], dict[str, AppointmentType | None]]:
     """
-    Book back-to-back (or same-day) appointments for multiple family members.
-
-    Strategy:
-    1. For each member, run a slot search using the shared date window and time preference.
-    2. For 'back_to_back': sort available slots and pick consecutive time blocks
-       (one slot per member, each starting when the previous one ends).
-    3. For 'same_day': pick any available slots on the same calendar day.
-    4. Book all selected slots atomically; roll back any partial books on failure.
-    5. Return booked appointments + partial_failures list.
+    Pick one slot per member (back-to-back or same-day rules) without booking.
+    Returns (assigned_triples, appointment_type_cache).
     """
     from datetime import datetime as _dt
 
@@ -411,9 +406,6 @@ def book_family_appointments(db: Session, payload: BookFamilyAppointmentsInput) 
     date_to_dt = _dt(
         payload.date_to.year, payload.date_to.month, payload.date_to.day, 23, 59, tzinfo=TZ
     )
-
-    # ── Gather candidate slots for all members ────────────────────────────────
-    # We do a single pass over available slots and then assign them greedily.
 
     all_candidate_slots: list[AppointmentSlot] = []
     appt_type_cache: dict[str, AppointmentType | None] = {}
@@ -449,7 +441,6 @@ def book_family_appointments(db: Session, payload: BookFamilyAppointmentsInput) 
             slots = [s for s in slots if hour_min <= s.starts_at.astimezone(TZ).hour < hour_max]
         all_candidate_slots.extend(slots)
 
-    # Deduplicate and sort by start time
     seen: set[str] = set()
     unique_slots: list[AppointmentSlot] = []
     for s in sorted(all_candidate_slots, key=lambda x: x.starts_at):
@@ -457,8 +448,7 @@ def book_family_appointments(db: Session, payload: BookFamilyAppointmentsInput) 
             seen.add(s.id)
             unique_slots.append(s)
 
-    # ── Assign slots per member ───────────────────────────────────────────────
-    assigned: list[tuple[AppointmentSlot, AppointmentType, "FamilyBookingMemberIn"]] = []
+    assigned: list[tuple[AppointmentSlot, AppointmentType, FamilyBookingMemberIn]] = []
     used_slot_ids: set[str] = set()
     last_end: _dt | None = None
 
@@ -470,7 +460,7 @@ def book_family_appointments(db: Session, payload: BookFamilyAppointmentsInput) 
 
         appt_type = appt_type_cache.get(appt_code)
         if not appt_type:
-            continue  # will be counted as partial_failure below
+            continue
 
         for slot in unique_slots:
             if slot.id in used_slot_ids:
@@ -479,24 +469,28 @@ def book_family_appointments(db: Session, payload: BookFamilyAppointmentsInput) 
                 continue
 
             if payload.group_preference == "back_to_back" and last_end is not None:
-                # Accept only if this slot starts right when the previous ends
-                # (within a 1-minute tolerance for rounding)
                 gap = (slot.starts_at - last_end).total_seconds()
                 if not (0 <= gap <= 60):
                     continue
 
-            # Candidate found
             assigned.append((slot, appt_type, member))
             used_slot_ids.add(slot.id)
             last_end = slot.ends_at
             break
 
-    # ── Book all assigned slots ───────────────────────────────────────────────
+    return assigned, appt_type_cache
+
+
+def _finalize_family_bookings(
+    db: Session,
+    payload: BookFamilyAppointmentsInput,
+    assigned: list[tuple[AppointmentSlot, AppointmentType, FamilyBookingMemberIn]],
+) -> BookFamilyAppointmentsOutput:
+    """Persist appointments for an assignment; members without a slot are partial failures."""
     booked_appointments: list[AppointmentOut] = []
     partial_failures: list[str] = []
 
     for slot, appt_type, member in assigned:
-        # Re-check availability inside the transaction
         fresh = db.get(AppointmentSlot, slot.id)
         if not fresh or fresh.slot_status != "available":
             partial_failures.append(member.patient_id)
@@ -521,7 +515,6 @@ def book_family_appointments(db: Session, payload: BookFamilyAppointmentsInput) 
         db.flush()
         booked_appointments.append(_appt_to_out(appointment, db))
 
-    # Members that had no slot assigned at all
     assigned_patient_ids = {m.patient_id for _, _, m in assigned}
     for member in payload.members:
         if member.patient_id not in assigned_patient_ids:
@@ -535,3 +528,57 @@ def book_family_appointments(db: Session, payload: BookFamilyAppointmentsInput) 
         all_booked=len(partial_failures) == 0,
         partial_failures=list(set(partial_failures)),
     )
+
+
+def book_family_appointments_from_proposed_slots(
+    db: Session, payload: BookFamilyAppointmentsInput, slot_ids: list[str]
+) -> BookFamilyAppointmentsOutput:
+    """
+    Book using slot IDs from a prior proposal (same order as payload.members).
+    Re-checks availability before committing.
+    """
+    if len(slot_ids) != len(payload.members):
+        return BookFamilyAppointmentsOutput(
+            appointments=[],
+            group_preference=payload.group_preference,
+            all_booked=False,
+            partial_failures=[m.patient_id for m in payload.members],
+        )
+
+    assigned: list[tuple[AppointmentSlot, AppointmentType, FamilyBookingMemberIn]] = []
+
+    for slot_id, member in zip(slot_ids, payload.members, strict=True):
+        try:
+            appt_code = normalize_appointment_type(member.appointment_type_code)
+        except ValueError:
+            appt_code = member.appointment_type_code
+
+        appt_type = db.execute(
+            select(AppointmentType).where(AppointmentType.code == appt_code)
+        ).scalar_one_or_none()
+        if not appt_type:
+            continue
+
+        slot = db.get(AppointmentSlot, slot_id)
+        if not slot or slot.appointment_type_id != appt_type.id:
+            continue
+
+        assigned.append((slot, appt_type, member))
+
+    return _finalize_family_bookings(db, payload, assigned)
+
+
+def book_family_appointments(db: Session, payload: BookFamilyAppointmentsInput) -> BookFamilyAppointmentsOutput:
+    """
+    Book back-to-back (or same-day) appointments for multiple family members.
+
+    Strategy:
+    1. For each member, run a slot search using the shared date window and time preference.
+    2. For 'back_to_back': sort available slots and pick consecutive time blocks
+       (one slot per member, each starting when the previous one ends).
+    3. For 'same_day': pick any available slots on the same calendar day.
+    4. Book all selected slots atomically; roll back any partial books on failure.
+    5. Return booked appointments + partial_failures list.
+    """
+    assigned, _ = assign_family_appointment_slots(db, payload)
+    return _finalize_family_bookings(db, payload, assigned)

@@ -360,13 +360,14 @@ WORKFLOWS: dict[Workflow, WorkflowDef] = {
     Workflow.FAMILY_BOOKING: WorkflowDef(
         workflow=Workflow.FAMILY_BOOKING,
         display_name="Family Booking",
-        required_fields=["family_count", "appointment_type", "preferred_date_from"],
-        optional_fields=["group_preference", "preferred_time_of_day"],
+        # Per-member + group scheduling are driven by state_machine/family_booking.py
+        required_fields=[],
+        optional_fields=[],
         tool_name="book_family_appointments",
         requires_patient_id=True,
         requires_confirmation=True,
-        greeting="Love it, I can get everyone booked! How many people are we looking at?",
-        ready_message="Nice! Let me just confirm what I've got before I go find some times:",
+        greeting="Love it — I can get everyone booked.",
+        ready_message="Here's what I have for your family booking:",
     ),
     # ------------------------------------------------------------------
     # Emergency triage

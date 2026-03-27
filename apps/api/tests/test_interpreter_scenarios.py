@@ -127,7 +127,8 @@ class TestMultiFieldExtraction:
         inp = _make_input(
             "This is for my daughter, she needs a cleaning",
             workflow="family_booking",
-            missing_keys=["family_count", "appointment_type"],
+            # Hint only appointment_type so keyword path still extracts it (family flow is custom).
+            missing_keys=["appointment_type"],
         )
         out = _keyword_interpret(inp)
         assert out.extracted_fields.get("appointment_type") == "cleaning"

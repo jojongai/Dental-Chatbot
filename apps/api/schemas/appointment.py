@@ -115,6 +115,8 @@ class FamilyBookingMemberIn(BaseModel):
     appointment_type_code: AppointmentTypeCode
     preferred_time_of_day: TimeOfDay = "any"
     special_instructions: str | None = None
+    display_name: str | None = Field(None, description="Full name for confirmations / receipts")
+    relation: str | None = Field(None, description="Relation to primary contact, e.g. child, spouse")
 
 
 class FamilyBookingIn(BaseModel):

@@ -12,6 +12,9 @@ Deterministic extractors (referenced from definitions.FIELDS, always run):
   extract_full_name, extract_last_name, extract_phone, extract_email,
   extract_dob, extract_confirmation
 
+Lenient DOB (family booking, etc.): extract_dob_lenient — same as extract_dob,
+  plus glued day+year and optional LLM when USE_LLM is true.
+
 Semantic fallback extractors (used ONLY by the interpreter's keyword/regex
 fallback path when USE_LLM=false or the API is unavailable):
   extract_insurance, extract_appointment_type, extract_preferred_date,
@@ -152,10 +155,24 @@ _MONTHS: dict[str, int] = {
     "jul": 7,
     "aug": 8,
     "sep": 9,
+    "sept": 9,
     "oct": 10,
     "nov": 11,
     "dec": 12,
 }
+
+# Birth years in UI (not arbitrary future scheduling)
+_YEAR = r"(19\d{2}|20\d{2})"
+
+
+def _month_num(token: str) -> int | None:
+    """Resolve month name or common abbreviation (handles 'Sept.', typos)."""
+    t = token.lower().strip().rstrip(".")
+    if t in _MONTHS:
+        return _MONTHS[t]
+    if t.startswith("sept"):
+        return 9
+    return None
 
 
 def extract_dob(text: str) -> date | None:
@@ -166,26 +183,75 @@ def extract_dob(text: str) -> date | None:
       "March 14, 1985", "14 March 1985", "born March 14 1985"
     """
     # YYYY-[M]M-[D]D
-    m = re.search(r"\b(19\d{2}|20[012]\d)[/\-](\d{1,2})[/\-](\d{1,2})\b", text)
+    m = re.search(rf"\b(19\d{{2}}|20\d{{2}})[/\-](\d{{1,2}})[/\-](\d{{1,2}})\b", text)
     if m:
         return _safe_date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
 
     # [M]M/[D]D/YYYY or [M]M-[D]D-YYYY
-    m = re.search(r"\b(\d{1,2})[/\-](\d{1,2})[/\-](19\d{2}|20[012]\d)\b", text)
+    m = re.search(rf"\b(\d{{1,2}})[/\-](\d{{1,2}})[/\-]({_YEAR})\b", text)
     if m:
         return _safe_date(int(m.group(3)), int(m.group(1)), int(m.group(2)))
 
     # "March 14, 1985" or "born on March 14, 1985"
-    m = re.search(r"\b([A-Za-z]+)\s+(\d{1,2}),?\s+(19\d{2}|20[012]\d)\b", text, re.IGNORECASE)
-    if m and m.group(1).lower() in _MONTHS:
-        return _safe_date(int(m.group(3)), _MONTHS[m.group(1).lower()], int(m.group(2)))
+    m = re.search(rf"\b([A-Za-z]+)\s+(\d{{1,2}}),?\s+({_YEAR})\b", text, re.IGNORECASE)
+    if m:
+        mon = _month_num(m.group(1))
+        if mon is not None:
+            return _safe_date(int(m.group(3)), mon, int(m.group(2)))
 
     # "14 March 1985"
-    m = re.search(r"\b(\d{1,2})\s+([A-Za-z]+)\s+(19\d{2}|20[012]\d)\b", text, re.IGNORECASE)
-    if m and m.group(2).lower() in _MONTHS:
-        return _safe_date(int(m.group(3)), _MONTHS[m.group(2).lower()], int(m.group(1)))
+    m = re.search(rf"\b(\d{{1,2}})\s+([A-Za-z]+)\s+({_YEAR})\b", text, re.IGNORECASE)
+    if m:
+        mon = _month_num(m.group(2))
+        if mon is not None:
+            return _safe_date(int(m.group(3)), mon, int(m.group(1)))
 
     return None
+
+
+def _extract_dob_month_glued_day_year(text: str) -> date | None:
+    """
+    'September 222004' → missing space between day 22 and year 2004.
+    Pattern: MonthName + whitespace + DD + YYYY (6 digits total after month).
+    """
+    m = re.search(r"\b([A-Za-z]+)\s+(\d{2})(\d{4})\b", text, re.IGNORECASE)
+    if not m:
+        return None
+    mon = _month_num(m.group(1))
+    if mon is None:
+        return None
+    day = int(m.group(2))
+    year = int(m.group(3))
+    if not (1900 <= year <= 2099):
+        return None
+    return _safe_date(year, mon, day)
+
+
+def extract_dob_lenient(text: str) -> date | None:
+    """
+    Same as extract_dob, plus informal / typo-tolerant patterns, then optional LLM.
+
+    Handles cases like 'Sept 22 2003', 'September 222004', messy SMS input.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None
+
+    d = extract_dob(raw)
+    if d is not None:
+        return d
+
+    d = _extract_dob_month_glued_day_year(raw)
+    if d is not None:
+        return d
+
+    # LLM last — only when USE_LLM (tests keep USE_LLM=false)
+    try:
+        from llm.date_parse import parse_birth_date_via_llm
+
+        return parse_birth_date_via_llm(raw)
+    except Exception:
+        return None
 
 
 def _safe_date(year: int, month: int, day: int) -> date | None:
@@ -616,14 +682,112 @@ def extract_confirmation(text: str) -> bool | None:
 
 def extract_family_count(text: str) -> int | None:
     """Extract how many people need appointments in family booking."""
+    stripped = text.strip()
+    if re.fullmatch(r"[2-9]", stripped):
+        return int(stripped)
+    if re.fullmatch(r"1[0-9]?", stripped):
+        n = int(stripped)
+        return n if 2 <= n <= 15 else None
     lower = text.lower()
-    word_nums = {"two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "2": 2, "3": 3, "4": 4, "5": 5}
+    word_nums = {
+        "two": 2,
+        "three": 3,
+        "four": 4,
+        "five": 5,
+        "six": 6,
+        "seven": 7,
+        "eight": 8,
+        "nine": 9,
+        "ten": 10,
+        "2": 2,
+        "3": 3,
+        "4": 4,
+        "5": 5,
+    }
     for word, num in word_nums.items():
         if word in lower:
             return num
-    m = re.search(r"\b(\d+)\s+(?:people|patients|members|kids|children|of us)", lower)
+    m = re.search(r"\b(\d+)\s+(?:people|patients|members|kids|children|of us|persons?)", lower)
     if m:
-        return int(m.group(1))
+        n = int(m.group(1))
+        return n if 2 <= n <= 15 else None
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Family member — relation to primary contact
+# ---------------------------------------------------------------------------
+
+
+def extract_relation_to_contact(text: str) -> str | None:
+    """
+    Map free text to a short relation label for family booking.
+    """
+    lower = text.strip().lower()
+    if not lower:
+        return None
+    if any(
+        k in lower
+        for k in (
+            "myself",
+            " myself",
+            "me only",
+            "just me",
+            "i am",
+            "that's me",
+            "thats me",
+            "self",
+        )
+    ) or re.match(r"^(me|i|self)\b", lower):
+        return "self"
+    if any(k in lower for k in ("spouse", "husband", "wife", "partner", "fiancé", "fiance")):
+        return "spouse"
+    if any(k in lower for k in ("son", "daughter", "child", "kid", "my boy", "my girl")):
+        return "child"
+    if any(k in lower for k in ("mother", "father", "mom", "dad", "parent")):
+        return "parent"
+    if "sibling" in lower or "brother" in lower or "sister" in lower:
+        return "sibling"
+    if "grand" in lower:
+        return "grandparent"
+    # Fallback: short free-text label
+    if len(lower) <= 40 and re.match(r"^[a-z\s\-']+$", lower):
+        return lower.strip()[:40]
+    return None
+
+
+def parse_family_member_patient_status(text: str) -> str | None:
+    """Return 'new' or 'existing' for a family member, or None if unclear."""
+    lower = text.strip().lower()
+    _new = (
+        "new patient",
+        "new ",
+        "never been",
+        "first time",
+        "first visit",
+        "not been here",
+        "brand new",
+        "register",
+    )
+    _existing = (
+        "existing",
+        "already",
+        "been before",
+        "current patient",
+        "returning",
+        "seen here before",
+        "regular patient",
+    )
+    for phrase in _existing:
+        if phrase in lower:
+            return "existing"
+    for phrase in _new:
+        if phrase in lower:
+            return "new"
+    if lower in ("n", "new"):
+        return "new"
+    if lower in ("e", "ex", "existing"):
+        return "existing"
     return None
 
 

@@ -363,6 +363,14 @@ class WorkflowStateMachine:
             )
             return self.process(message, _depth=_depth + 1)
 
+        # 7.5 Family booking — multi-person collection (not driven by required_fields)
+        if self.state.workflow == Workflow.FAMILY_BOOKING and self.state.patient_id:
+            from state_machine.family_booking import run_family_booking_turn
+
+            fb_result = run_family_booking_turn(self, message, wf_def, is_first_turn, interp)
+            if fb_result is not None:
+                return fb_result
+
         # 8. Compute what's still missing
         missing = self._compute_missing(wf_def)
         self.state = self.state.model_copy(update={"missing_fields": missing})
@@ -424,6 +432,12 @@ class WorkflowStateMachine:
             pending_field = self.state.step.split(":", 1)[1]
             fd = FIELDS.get(pending_field)
             pending_question = fd.prompt if fd else None
+        elif self.state.step == "awaiting_family_slot_confirmation":
+            pending_field = "confirmation"
+            pending_question = (
+                "Maya listed specific appointment times for each family member and asked whether "
+                "to go ahead and reserve those times."
+            )
 
         clean_collected = {
             k: v for k, v in self.state.collected_fields.items() if not k.startswith("_")
@@ -598,8 +612,13 @@ class WorkflowStateMachine:
         )
 
     def _handle_confirmation_rejected(self, wf_def: WorkflowDef) -> MachineResult:
+        next_step = (
+            "family:scheduling:preference"
+            if wf_def.workflow == Workflow.FAMILY_BOOKING
+            else "collecting"
+        )
         return MachineResult(
-            state=self.state.model_copy(update={"step": "collecting"}),
+            state=self.state.model_copy(update={"step": next_step}),
             reply="No problem! What would you like to change?",
             ready_to_call=False,
             actions=[],
@@ -686,6 +705,11 @@ class WorkflowStateMachine:
         _fmt("group_preference", "Scheduling preference")
 
         return "\n".join(lines) if lines else "(no details collected yet)"
+
+    def _build_family_booking_summary(self) -> str:
+        from state_machine.family_booking import family_booking_summary_markdown
+
+        return family_booking_summary_markdown(dict(self.state.collected_fields))
 
     def _debug_snapshot(self, wf_def: WorkflowDef) -> dict:
         return {

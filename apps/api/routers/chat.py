@@ -483,12 +483,10 @@ def _resume_pending_workflow(
         return reply, new_state, ["lookup_patient", "list_patient_appointments"]
 
     if pending == "family_booking":
-        # Resume family booking workflow — prompt for appointment type/date now that we have patient_id
         new_state = state.model_copy(update={"workflow": "family_booking", "step": "collecting"})
         return (
             f"Got it, welcome back {first_name}! "
-            "Now let's get everyone booked. What type of appointment does each person need — "
-            "cleaning, check-up, or something else?",
+            "Let's get everyone booked — how many people are we scheduling?",
             new_state,
             ["lookup_patient"],
         )
@@ -1106,16 +1104,26 @@ def _dispatch_family_booking(
     practice_id: str,
 ) -> tuple[str, WorkflowState, list[str]]:
     """
-    Attempt grouped family booking using the collected fields.
-    Falls back to a staff callback / manual-review notification if exact
-    grouped slots cannot be found.
+    Book one appointment per resolved family member, preferring consecutive slots
+    per group_preference. Uses per-member appointment types from the structured
+    family_members list. Unresolved patient IDs trigger staff notification.
     """
     from datetime import date as _date, timedelta
-    from schemas.appointment import FamilyBookingIn, FamilyBookingMemberIn
-    from schemas.tools import BookFamilyAppointmentsInput, CreateStaffNotificationInput
-    from tools.scheduling_tools import book_family_appointments
+
+    from models.patient import Patient
+    from schemas.appointment import FamilyBookingMemberIn
+    from schemas.tools import BookFamilyAppointmentsInput, CreatePatientInput, CreateStaffNotificationInput, LookupPatientInput
+    from tools.patient_tools import create_patient, lookup_patient
+    from tools.scheduling_tools import (
+        assign_family_appointment_slots,
+        book_family_appointments,
+        book_family_appointments_from_proposed_slots,
+    )
     from tools.notification_tools import create_staff_notification
-    from tools.validators import normalize_appointment_type
+    from tools.validators import fmt_date, fmt_time_range, normalize_appointment_type
+    from zoneinfo import ZoneInfo
+
+    _TZ = ZoneInfo("America/Toronto")
 
     if not state.patient_id:
         return (
@@ -1124,23 +1132,22 @@ def _dispatch_family_booking(
             [],
         )
 
-    # Build member list from collected fields.
-    # family_count tells us how many; appointment_type is shared unless per-member types collected.
-    family_count = int(tool_input_data.get("family_count") or 2)
-    raw_type = (
-        tool_input_data.get("appointment_type")
-        or tool_input_data.get("appointment_type_code")
-        or "cleaning"
-    )
-    try:
-        appt_code = normalize_appointment_type(str(raw_type))
-    except ValueError:
-        appt_code = "cleaning"
+    raw_members = tool_input_data.get("family_members") or []
+    gp = tool_input_data.get("group_preferences") or {}
+    if not raw_members:
+        return (
+            "I’m missing the family member details — please start the family booking again.",
+            state,
+            [],
+        )
 
-    preferred_time = tool_input_data.get("preferred_time_of_day") or "any"
-    group_pref = tool_input_data.get("group_preference") or "back_to_back"
+    primary = db.get(Patient, state.patient_id)
+    primary_phone = primary.phone_number if primary else ""
 
-    date_from = tool_input_data.get("preferred_date_from") or _date.today() + timedelta(days=1)
+    preferred_time_global = gp.get("preferred_time_of_day") or tool_input_data.get("preferred_time_of_day") or "any"
+    group_pref = gp.get("group_preference") or tool_input_data.get("group_preference") or "back_to_back"
+
+    date_from = gp.get("preferred_date_from") or tool_input_data.get("preferred_date_from") or _date.today() + timedelta(days=1)
     if isinstance(date_from, str):
         try:
             date_from = _date.fromisoformat(date_from)
@@ -1148,79 +1155,209 @@ def _dispatch_family_booking(
             date_from = _date.today() + timedelta(days=1)
     date_to = date_from + timedelta(days=14)
 
-    # All family members share the same patient_id (primary account holder) for this
-    # prototype — a production version would collect individual patient records.
-    members = [
-        FamilyBookingMemberIn(
-            patient_id=state.patient_id,
-            appointment_type_code=appt_code,
-            preferred_time_of_day=preferred_time,
+    # Resolve each member → patient_id (primary for self; lookup; create for new when possible)
+    booking_members: list[FamilyBookingMemberIn] = []
+    unresolved: list[str] = []
+
+    for i, m in enumerate(raw_members):
+        fn = (m.get("first_name") or "").strip()
+        ln = (m.get("last_name") or "").strip()
+        rel = (m.get("relation") or "").strip().lower()
+        status = (m.get("patient_status") or "").strip().lower()
+        display_name = f"{fn} {ln}".strip() or f"member_{i + 1}"
+
+        try:
+            appt_code = normalize_appointment_type(str(m.get("appointment_type") or "cleaning"))
+        except ValueError:
+            appt_code = "cleaning"
+
+        tod = preferred_time_global
+        pid: str | None = None
+
+        if rel == "self" or rel in ("me", "myself", "i"):
+            pid = state.patient_id
+        else:
+            lu = lookup_patient(
+                db,
+                LookupPatientInput(first_name=fn, last_name=ln, phone_number=primary_phone),
+                practice_id=practice_id,
+            )
+            if lu.found and lu.patient:
+                pid = lu.patient.id
+            elif status == "new" and m.get("date_of_birth"):
+                dob = m["date_of_birth"]
+                if isinstance(dob, str):
+                    try:
+                        dob = _date.fromisoformat(dob)
+                    except ValueError:
+                        dob = None
+                if dob is not None:
+                    cp = create_patient(
+                        db,
+                        CreatePatientInput(
+                            first_name=fn or "Family",
+                            last_name=ln or "Member",
+                            phone_number=primary_phone,
+                            date_of_birth=dob,
+                        ),
+                        practice_id=practice_id,
+                    )
+                    if cp.success and cp.patient:
+                        pid = cp.patient.id
+
+        if pid is None:
+            unresolved.append(display_name)
+            continue
+
+        booking_members.append(
+            FamilyBookingMemberIn(
+                patient_id=pid,
+                appointment_type_code=appt_code,
+                preferred_time_of_day=tod,
+                display_name=display_name,
+                relation=m.get("relation"),
+                special_instructions=f"Family booking — {m.get('relation', '')}",
+            )
         )
-        for _ in range(family_count)
-    ]
+
+    if unresolved:
+        body = (
+            f"Family booking (primary patient_id={state.patient_id}) needs manual patient matching for: "
+            f"{', '.join(unresolved)}. Raw request: {raw_members!r}. Group prefs: {gp!r}."
+        )
+        create_staff_notification(
+            db,
+            CreateStaffNotificationInput(
+                notification_type="family_scheduling_complexity",
+                priority="normal",
+                title="Family booking — unresolved family members",
+                body=body,
+                patient_id=state.patient_id,
+                practice_id=practice_id,
+            ),
+            practice_id=practice_id,
+        )
+
+    if len(booking_members) < 2:
+        reply = (
+            "I need at least two people with chart IDs I can book into before I can reserve slots together. "
+            "I've sent your family details to our team — someone will call to finish setting everyone up."
+        )
+        new_state = state.model_copy(update={"step": "confirmed"})
+        return reply, new_state, ["create_staff_notification"]
 
     payload = BookFamilyAppointmentsInput(
-        members=members,
+        members=booking_members,
         group_preference=group_pref,
         date_from=date_from,
         date_to=date_to,
         conversation_id=state.conversation_id,
     )
 
-    result = book_family_appointments(db, payload)
+    proposed_ids = state.collected_fields.get("_family_proposed_slot_ids")
 
-    if result.all_booked:
-        appt_lines = "\n".join(
-            f"{i + 1}. {a.appointment_type_display} — {a.date_label}, {a.time_label}"
-            for i, a in enumerate(result.appointments)
+    # Second step: user already saw exact times and confirmed — book those slots.
+    if proposed_ids and isinstance(proposed_ids, list) and len(proposed_ids) == len(booking_members):
+        result = book_family_appointments_from_proposed_slots(db, payload, proposed_ids)
+        tools_called = ["book_family_appointments"]
+        new_cf = {k: v for k, v in state.collected_fields.items() if k != "_family_proposed_slot_ids"}
+
+        if result.all_booked:
+            appt_lines = "\n".join(
+                f"{i + 1}. {a.patient_name} — {a.appointment_type_display} — {a.date_label}, {a.time_label}"
+                for i, a in enumerate(result.appointments)
+            )
+            reply = (
+                f"All set — here's one appointment per person:\n\n{appt_lines}\n\n"
+                "You'll get a confirmation for each. See you all soon!"
+            )
+            new_state = state.model_copy(update={"step": "confirmed", "collected_fields": new_cf})
+            return reply, new_state, tools_called
+
+        booked_count = len(result.appointments)
+        failed_count = len(result.partial_failures)
+        create_staff_notification(
+            db,
+            CreateStaffNotificationInput(
+                notification_type="family_scheduling_complexity",
+                priority="normal",
+                title="Family booking requires manual coordination",
+                body=(
+                    f"Proposal confirm failed: {booked_count} ok, {failed_count} failed. "
+                    f"primary={state.patient_id}, prefs={gp!r}"
+                ),
+                patient_id=state.patient_id,
+                practice_id=practice_id,
+            ),
+            practice_id=practice_id,
         )
+        tools_called.append("create_staff_notification")
+
+        if booked_count == 0:
+            reply = (
+                "Those times are no longer available. I've flagged our team — they'll call to coordinate."
+            )
+        else:
+            booked_lines = "\n".join(
+                f"{i + 1}. {a.patient_name} — {a.appointment_type_display} — {a.date_label}, {a.time_label}"
+                for i, a in enumerate(result.appointments)
+            )
+            reply = (
+                f"I booked {booked_count} appointment(s):\n\n{booked_lines}\n\n"
+                f"I couldn't confirm the remaining slot(s) — they may have been taken. "
+                "Our team will follow up."
+            )
+
+        new_state = state.model_copy(update={"step": "confirmed", "collected_fields": new_cf})
+        return reply, new_state, tools_called
+
+    # First step: find slots and show exact times — book only after a second yes.
+    assigned, _ = assign_family_appointment_slots(db, payload)
+    tools_called = ["propose_family_slots"]
+
+    if len(assigned) == len(payload.members):
+        slot_ids = [s.id for s, _, _ in assigned]
+        proposal_lines = []
+        for i, (slot, appt_type, member) in enumerate(assigned):
+            starts = slot.starts_at.astimezone(_TZ)
+            ends = slot.ends_at.astimezone(_TZ)
+            label = member.display_name or "Patient"
+            proposal_lines.append(
+                f"{i + 1}. {label} — {appt_type.display_name} — {fmt_date(starts)}, {fmt_time_range(starts, ends)}"
+            )
+        lines_txt = "\n".join(proposal_lines)
         reply = (
-            f"All booked! Here's a summary of the appointments:\n\n"
-            f"{appt_lines}\n\n"
-            "You'll receive a confirmation for each one. See you all soon!"
+            "Here are the exact times I can reserve for everyone:\n\n"
+            f"{lines_txt}\n\n"
+            "Let me know if you’d like me to book these — or tell me what you’d like to change "
+            "(day, time of day, back-to-back vs same day, etc.)."
         )
-        new_state = state.model_copy(update={"step": "confirmed"})
-        return reply, new_state, ["book_family_appointments"]
+        new_cf = {**state.collected_fields, "_family_proposed_slot_ids": slot_ids}
+        new_state = state.model_copy(
+            update={"step": "awaiting_family_slot_confirmation", "collected_fields": new_cf}
+        )
+        return reply, new_state, tools_called
 
-    # Partial or no bookings — notify staff for manual coordination
-    booked_count = len(result.appointments)
-    failed_count = len(result.partial_failures)
-
-    notif_body = (
-        f"Family booking request for patient_id={state.patient_id}. "
-        f"Requested {family_count} x {appt_code} ({group_pref}) from {date_from}. "
-        f"Booked {booked_count}, failed {failed_count}. "
-        f"Manual coordination required."
-    )
+    # Could not assign everyone — same messaging as before, without booking.
     create_staff_notification(
         db,
         CreateStaffNotificationInput(
             notification_type="family_scheduling_complexity",
             priority="normal",
             title="Family booking requires manual coordination",
-            body=notif_body,
+            body=(
+                f"No full assignment for family booking. primary={state.patient_id}, prefs={gp!r}"
+            ),
             patient_id=state.patient_id,
             practice_id=practice_id,
         ),
         practice_id=practice_id,
     )
+    tools_called.append("create_staff_notification")
 
-    if booked_count == 0:
-        reply = (
-            "I wasn't able to find back-to-back slots for everyone in that window. "
-            "I've flagged this for our team and someone will call you to coordinate a time that works for the whole family."
-        )
-    else:
-        booked_lines = "\n".join(
-            f"{i + 1}. {a.appointment_type_display} — {a.date_label}, {a.time_label}"
-            for i, a in enumerate(result.appointments)
-        )
-        reply = (
-            f"I managed to book {booked_count} of the {family_count} appointments:\n\n"
-            f"{booked_lines}\n\n"
-            f"I couldn't fit the remaining {failed_count} into that window back-to-back. "
-            "Our team will reach out to sort the rest — sorry for the extra step!"
-        )
-
+    reply = (
+        "I couldn't find grouped slots that work for everyone in that window. "
+        "I've flagged our team — they'll call to coordinate times."
+    )
     new_state = state.model_copy(update={"step": "confirmed"})
-    return reply, new_state, ["book_family_appointments", "create_staff_notification"]
+    return reply, new_state, tools_called
