@@ -1,6 +1,6 @@
 # Dental Chatbot
 
-Monorepo for a dental-office assistant chatbot: **Next.js** frontend (`apps/web`), **FastAPI** backend (`apps/api`), shared contracts (`packages/shared-types`), and prompts (`packages/prompts`).
+Monorepo for a dental-office assistant chatbot: **Next.js** chatbot UI (`apps/chatbot-ui`), **FastAPI** backend (`apps/api`), shared contracts (`packages/shared-types`), and prompts (`packages/prompts`).
 
 ## Tech stack (prototype)
 
@@ -61,10 +61,10 @@ See `docs/flows.md` for a full list of supported chat flows and their implementa
 - **Frontend only** (from root):
 
   ```bash
-  npm run dev -- --filter=@dental-chatbot/web
+  npm run dev -- --filter=@dental-chatbot/chatbot-ui
   ```
 
-  Or: `cd apps/web && npm run dev` → [http://localhost:3000](http://localhost:3000)
+  Or: `cd apps/chatbot-ui && npm run dev` → [http://localhost:3000](http://localhost:3000) (employee dashboard: [http://localhost:3000/employee](http://localhost:3000/employee))
 
 - **Backend only** (with uv sync done in `apps/api`):
 
@@ -83,7 +83,7 @@ See `docs/flows.md` for a full list of supported chat flows and their implementa
 ## Layout
 
 ```
-apps/web          # Next.js + Tailwind + shadcn/ui
+apps/chatbot-ui   # Next.js + Tailwind + shadcn/ui — SMS demo (`/`) + employee schedule (`/employee`, mock data)
 apps/api          # FastAPI + Pydantic + SQLAlchemy + uv
 packages/prompts  # System prompts & fragments
 packages/shared-types  # Zod schemas / TS types (mirror in Pydantic)

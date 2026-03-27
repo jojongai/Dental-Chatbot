@@ -2,10 +2,15 @@
 Demo seed script — populates all must-have tables with realistic sample data.
 
 Usage (from apps/api/):
-    uv run python seed.py           # or: python3 -m uv run python seed.py
-    python seed.py                  # if .venv is activated
+    uv run python seed.py              # create tables if missing, then seed
+    uv run python seed.py --reset      # SQLite only: drop all tables, recreate, seed
+    python seed.py                     # if .venv is activated
+
+Without --reset, re-running on an already-seeded DB will usually fail (duplicate rows).
+For a clean SQLite DB, either delete the file (e.g. data/app.db) or use --reset.
 """
 
+import argparse
 import sys
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -14,7 +19,8 @@ from zoneinfo import ZoneInfo
 # Ensure apps/api is on sys.path when run directly.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from database import SessionLocal, init_db
+from database import SessionLocal, engine, init_db
+from models.base import Base
 from models import (
     Appointment,
     AppointmentSlot,
@@ -57,6 +63,37 @@ def today_local() -> date:
     return datetime.now(TZ).date()
 
 
+def _next_march_27_30_window() -> tuple[date, date]:
+    """
+    Next March 27 (Fri) and March 30 (Mon) pair where March 30 is still on or after today.
+    Used to place demo appointments on those weekdays.
+    """
+    t = today_local()
+    for y in range(t.year, t.year + 3):
+        mon = date(y, 3, 30)
+        if mon >= t:
+            return date(y, 3, 27), mon
+    y = t.year + 1
+    return date(y, 3, 27), date(y, 3, 30)
+
+
+def _slots_on_day(slots: list[AppointmentSlot], d: date) -> list[AppointmentSlot]:
+    return sorted(
+        [s for s in slots if s.starts_at.astimezone(TZ).date() == d],
+        key=lambda s: s.starts_at,
+    )
+
+
+def _slot_on_day(slots: list[AppointmentSlot], d: date, index: int) -> AppointmentSlot:
+    day = _slots_on_day(slots, d)
+    if len(day) <= index:
+        raise RuntimeError(
+            f"Seed: need slot index {index} on {d}, found {len(day)} slots. "
+            "Increase generate_slots days or fix demo dates."
+        )
+    return day[index]
+
+
 def generate_slots(
     location_id: str,
     provider_id: str,
@@ -94,13 +131,31 @@ def generate_slots(
     return slots
 
 
+def reset_database() -> None:
+    """Drop all tables and recreate (SQLite only)."""
+    from config import get_settings
+
+    if not get_settings().database_url.startswith("sqlite"):
+        print(
+            "Error: --reset only supports SQLite DATABASE_URL. "
+            "For Postgres or others, use alembic or drop the DB manually.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    Base.metadata.drop_all(bind=engine)
+    init_db()
+
+
 # ---------------------------------------------------------------------------
 # Seed
 # ---------------------------------------------------------------------------
 
 
-def seed() -> None:
-    init_db()
+def seed(*, reset: bool = False) -> None:
+    if reset:
+        reset_database()
+    else:
+        init_db()
     db = SessionLocal()
 
     try:
@@ -285,12 +340,22 @@ def seed() -> None:
         db.flush()
 
         # ------------------------------------------------------------------
-        # Appointment slots — next 14 days
+        # Appointment slots — wide enough to include demo days Mar 27 (Fri) & Mar 30 (Mon)
         # ------------------------------------------------------------------
-        start_date = today_local() + timedelta(days=1)
-        slots_dentist = generate_slots(location.id, dentist_provider.id, at_checkup.id, start_date)
-        slots_hygienist = generate_slots(location.id, hygienist_provider.id, at_cleaning.id, start_date)
-        db.add_all(slots_dentist + slots_hygienist)
+        demo_fri, demo_mon = _next_march_27_30_window()
+        start_date = min(today_local(), demo_fri)
+        days_needed = max(14, (demo_mon - start_date).days + 1)
+        slots_dentist = generate_slots(
+            location.id, dentist_provider.id, at_checkup.id, start_date, days=days_needed
+        )
+        slots_hygienist = generate_slots(
+            location.id, hygienist_provider.id, at_cleaning.id, start_date, days=days_needed
+        )
+        # Parallel "emergency" slots (same time grid as dentist check-ups) for demo bookings.
+        slots_emergency = generate_slots(
+            location.id, dentist_provider.id, at_emergency.id, start_date, days=days_needed
+        )
+        db.add_all(slots_dentist + slots_hygienist + slots_emergency)
         db.flush()
 
         # ------------------------------------------------------------------
@@ -401,7 +466,65 @@ def seed() -> None:
             is_existing_patient=True,
             status="active",
         )
-        db.add_all([patient_existing, patient_new, patient_child])
+        patient_maria = Patient(
+            practice_id=practice.id,
+            primary_location_id=location.id,
+            first_name="Maria",
+            last_name="Gonzalez",
+            date_of_birth=date(1978, 11, 2),
+            phone_number="(416) 555-2010",
+            email="maria.gonzalez@example.com",
+            preferred_contact_method="phone",
+            is_existing_patient=True,
+            status="active",
+        )
+        patient_james = Patient(
+            practice_id=practice.id,
+            primary_location_id=location.id,
+            first_name="James",
+            last_name="Chen",
+            date_of_birth=date(1992, 4, 18),
+            phone_number="(416) 555-2011",
+            email="james.chen@example.com",
+            preferred_contact_method="email",
+            is_existing_patient=True,
+            status="active",
+        )
+        patient_priya = Patient(
+            practice_id=practice.id,
+            primary_location_id=location.id,
+            first_name="Priya",
+            last_name="Sharma",
+            date_of_birth=date(1988, 8, 30),
+            phone_number="(416) 555-2012",
+            email="priya.sharma@example.com",
+            preferred_contact_method="email",
+            is_existing_patient=True,
+            status="active",
+        )
+        patient_david = Patient(
+            practice_id=practice.id,
+            primary_location_id=location.id,
+            first_name="David",
+            last_name="Kim",
+            date_of_birth=date(2001, 1, 25),
+            phone_number="(416) 555-2013",
+            email="david.kim@example.com",
+            preferred_contact_method="text",
+            is_existing_patient=True,
+            status="active",
+        )
+        db.add_all(
+            [
+                patient_existing,
+                patient_new,
+                patient_child,
+                patient_maria,
+                patient_james,
+                patient_priya,
+                patient_david,
+            ]
+        )
         db.flush()
 
         # Addresses
@@ -480,24 +603,94 @@ def seed() -> None:
         )
 
         # ------------------------------------------------------------------
-        # Sample appointment (existing patient, booked slot)
+        # Sample appointments (mix of statuses and channels)
         # ------------------------------------------------------------------
-        booked_slot = slots_dentist[0]
-        booked_slot.slot_status = "booked"
+        def book_demo_appointment(
+            slot: AppointmentSlot,
+            patient: Patient,
+            *,
+            provider_id: str,
+            appointment_type_id: str,
+            status: str,
+            booked_via: str = "chatbot",
+            reason: str | None = None,
+            is_emergency: bool = False,
+            emergency_summary: str | None = None,
+        ) -> None:
+            slot.slot_status = "booked"
+            db.add(
+                Appointment(
+                    patient_id=patient.id,
+                    slot_id=slot.id,
+                    location_id=location.id,
+                    provider_id=provider_id,
+                    appointment_type_id=appointment_type_id,
+                    status=status,
+                    booked_via=booked_via,
+                    scheduled_starts_at=slot.starts_at,
+                    scheduled_ends_at=slot.ends_at,
+                    reason_for_visit=reason,
+                    is_emergency=is_emergency,
+                    emergency_summary=emergency_summary,
+                )
+            )
 
-        appt = Appointment(
-            patient_id=patient_existing.id,
-            slot_id=booked_slot.id,
-            location_id=location.id,
+        # Demo appointments: Friday March 27 and Monday March 30 (same calendar year as demo_mon)
+        book_demo_appointment(
+            _slot_on_day(slots_dentist, demo_fri, 0),
+            patient_existing,
+            provider_id=dentist_provider.id,
+            appointment_type_id=at_checkup.id,
+            status="booked",
+            reason="Annual check-up",
+        )
+        book_demo_appointment(
+            _slot_on_day(slots_hygienist, demo_fri, 0),
+            patient_maria,
+            provider_id=hygienist_provider.id,
+            appointment_type_id=at_cleaning.id,
+            status="confirmed",
+            booked_via="phone",
+            reason="Routine cleaning",
+        )
+        book_demo_appointment(
+            _slot_on_day(slots_dentist, demo_fri, 1),
+            patient_james,
+            provider_id=dentist_provider.id,
+            appointment_type_id=at_checkup.id,
+            status="completed",
+            booked_via="staff",
+            reason="Follow-up exam",
+        )
+        book_demo_appointment(
+            _slot_on_day(slots_hygienist, demo_mon, 0),
+            patient_priya,
+            provider_id=hygienist_provider.id,
+            appointment_type_id=at_cleaning.id,
+            status="checked_in",
+            booked_via="chatbot",
+            reason="Cleaning",
+        )
+        book_demo_appointment(
+            _slot_on_day(slots_dentist, demo_mon, 0),
+            patient_new,
             provider_id=dentist_provider.id,
             appointment_type_id=at_checkup.id,
             status="booked",
             booked_via="chatbot",
-            scheduled_starts_at=booked_slot.starts_at,
-            scheduled_ends_at=booked_slot.ends_at,
-            reason_for_visit="Annual check-up",
+            reason="New patient exam",
         )
-        db.add(appt)
+        book_demo_appointment(
+            _slot_on_day(slots_emergency, demo_mon, 1),
+            patient_david,
+            provider_id=dentist_provider.id,
+            appointment_type_id=at_emergency.id,
+            status="confirmed",
+            booked_via="phone",
+            reason="Emergency visit",
+            is_emergency=True,
+            emergency_summary="Severe tooth pain (lower left)",
+        )
         db.flush()
 
         # ------------------------------------------------------------------
@@ -700,8 +893,15 @@ def seed() -> None:
         print(f"  Location:          {location.name} ({location.id})")
         print(f"  Providers:         {dentist_provider.display_name}, {hygienist_provider.display_name}")
         print("  Appointment types: cleaning, general_checkup, emergency, new_patient_exam")
-        print(f"  Slots seeded:      {len(slots_dentist) + len(slots_hygienist)}")
-        print("  Patients:          Alice Thompson (existing), Ben Kowalski (lead), Emma Thompson (child)")
+        total_slots = len(slots_dentist) + len(slots_hygienist) + len(slots_emergency)
+        print(f"  Slots seeded:      {total_slots}")
+        print(
+            "  Patients:          7 demo (Alice, Ben, Emma, Maria G., James C., Priya S., David K.)"
+        )
+        print(
+            f"  Appointments:      6 demo on Fri Mar {demo_fri.day} & Mon Mar {demo_mon.day} "
+            f"({demo_fri.year}) — check-ups, cleanings, 1 emergency"
+        )
         print(f"  FAQ entries:       {len(faq_data)}")
 
     except Exception:
@@ -712,4 +912,11 @@ def seed() -> None:
 
 
 if __name__ == "__main__":
-    seed()
+    parser = argparse.ArgumentParser(description="Seed the database with demo data.")
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help="SQLite only: drop all tables, recreate, then seed.",
+    )
+    args = parser.parse_args()
+    seed(reset=args.reset)

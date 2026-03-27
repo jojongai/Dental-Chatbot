@@ -479,9 +479,10 @@ class WorkflowStateMachine:
                 collected[k] = v
                 logger.debug("Interpreter extracted %r = %r", k, v)
 
-        # Deterministic override: regex is authoritative for phone, DOB, email
+        # Deterministic override: regex is authoritative for phone, DOB, email.
+        # Phone: always re-run regex even if the LLM filled a bogus value (e.g. pain "6" as phone).
         for field_key in _DETERMINISTIC_FIELDS:
-            if field_key in collected:
+            if field_key in collected and field_key != "phone_number":
                 continue
             fd = FIELDS.get(field_key)
             if fd and fd.extractor:
@@ -491,6 +492,14 @@ class WorkflowStateMachine:
                         collected[field_key] = val
                 except Exception:
                     pass
+
+        if "phone_number" in collected:
+            from tools.validators import normalize_phone
+
+            try:
+                collected["phone_number"] = normalize_phone(str(collected["phone_number"]).strip())
+            except ValueError:
+                collected.pop("phone_number", None)
 
         # Resolve preferred_date_from: the LLM often returns raw text ("next week",
         # "tomorrow") instead of a date object — run the regex extractor to convert.

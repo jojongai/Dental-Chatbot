@@ -8,8 +8,8 @@ The **dental-chatbot** monorepo separates the user-facing web app, the HTTP API,
 
 | Area                    | Role                                                                                                            |
 | ----------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `apps/web`              | **Next.js + React + TypeScript + Tailwind CSS + shadcn/ui**: chat UI, demo-friendly styling, Vercel deployment. |
-| `apps/api`              | **FastAPI + Pydantic**: REST, validation, and (later) LLM orchestration and tools.                              |
+| `apps/chatbot-ui`       | **Next.js + React + TypeScript + Tailwind CSS + shadcn/ui**: SMS chatbot UI (`/`), employee schedule dashboard (`/employee`, mock data), Vercel deployment. |
+| `apps/api`              | **FastAPI + Pydantic**: REST (`/chat`, `/v1/employee/schedule` for the employee calendar, tools, validation).   |
 | `packages/shared-types` | **Zod** schemas / TypeScript types mirrored loosely in Python (**Pydantic**) for request/response shapes.       |
 | `packages/prompts`      | System prompts and reusable prompt fragments (Markdown or structured text).                                     |
 | `infra/seed`            | Seed data and scripts for local or demo environments.                                                           |

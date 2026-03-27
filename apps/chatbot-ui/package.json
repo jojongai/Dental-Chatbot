@@ -1,5 +1,5 @@
 {
-  "name": "@dental-chatbot/web",
+  "name": "@dental-chatbot/chatbot-ui",
   "version": "0.1.0",
   "private": true,
   "scripts": {

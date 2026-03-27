@@ -304,6 +304,150 @@ def test_search_slots_no_match_returns_empty(db: Session) -> None:
     assert result.slots == []
 
 
+def test_search_slots_excludes_past_start_times(db: Session) -> None:
+    """Same-day slots that already started must not be offered (Toronto time)."""
+    slot1 = db.get(AppointmentSlot, "slot1")
+    assert slot1 is not None
+    past_start = datetime.now(TZ) - timedelta(hours=3)
+    past_end = past_start + timedelta(hours=1)
+    db.add(
+        AppointmentSlot(
+            id="slot_past",
+            location_id=slot1.location_id,
+            provider_id=slot1.provider_id,
+            appointment_type_id=slot1.appointment_type_id,
+            starts_at=past_start,
+            ends_at=past_end,
+            slot_status="available",
+        )
+    )
+    db.commit()
+
+    result = search_slots(
+        db,
+        SearchSlotsInput(
+            appointment_type_code="cleaning",
+            date_from=past_start.date(),
+            date_to=past_start.date() + timedelta(days=1),
+        ),
+    )
+    assert "slot_past" not in {s.id for s in result.slots}
+
+
+def test_search_slots_hides_parallel_type_when_provider_busy(db: Session) -> None:
+    """Emergency slot row at same time as a booked cleaning must not appear as free."""
+    slot1 = db.get(AppointmentSlot, "slot1")
+    assert slot1 is not None
+
+    at_em = AppointmentType(
+        id="at_em",
+        practice_id="p1",
+        code="emergency",
+        display_name="Emergency",
+        default_duration_minutes=60,
+        requires_provider_type="hygienist",
+        is_emergency=True,
+    )
+    db.add(at_em)
+    db.flush()
+
+    em_slot = AppointmentSlot(
+        id="slot_em_overlap",
+        location_id=slot1.location_id,
+        provider_id=slot1.provider_id,
+        appointment_type_id=at_em.id,
+        starts_at=slot1.starts_at,
+        ends_at=slot1.ends_at,
+        slot_status="available",
+    )
+    db.add(em_slot)
+    db.commit()
+
+    pat = create_patient(
+        db,
+        CreatePatientInput(
+            first_name="Busy",
+            last_name="Provider",
+            phone_number="(416) 555-9999",
+            date_of_birth=date(1991, 4, 4),
+        ),
+        practice_id="p1",
+    )
+    assert pat.success and pat.patient
+
+    book_result = book_appointment(
+        db,
+        BookAppointmentInput(
+            patient_id=pat.patient.id,
+            slot_id="slot1",
+            appointment_type_code="cleaning",
+        ),
+    )
+    assert book_result.success
+
+    result = search_slots(
+        db,
+        SearchSlotsInput(
+            appointment_type_code="emergency",
+            date_from=slot1.starts_at.date(),
+            date_to=slot1.starts_at.date() + timedelta(days=14),
+        ),
+    )
+    assert "slot_em_overlap" not in {s.id for s in result.slots}
+
+
+def test_emergency_slot_selection_creates_patient_when_state_has_no_patient_id(db: Session) -> None:
+    """Emergency triage collects identity but may omit patient_id — slot pick must still book."""
+    from routers.chat import _handle_slot_selection
+    from schemas.chat import Workflow, WorkflowState
+
+    slot1 = db.get(AppointmentSlot, "slot1")
+    assert slot1 is not None
+
+    at_em = AppointmentType(
+        id="at_em_book",
+        practice_id="p1",
+        code="emergency",
+        display_name="Emergency",
+        default_duration_minutes=60,
+        requires_provider_type="hygienist",
+        is_emergency=True,
+    )
+    db.add(at_em)
+    db.flush()
+
+    em_slot = AppointmentSlot(
+        id="slot_em_book",
+        location_id=slot1.location_id,
+        provider_id=slot1.provider_id,
+        appointment_type_id=at_em.id,
+        starts_at=slot1.starts_at + timedelta(days=1),
+        ends_at=slot1.ends_at + timedelta(days=1),
+        slot_status="available",
+    )
+    db.add(em_slot)
+    db.commit()
+
+    state = WorkflowState(
+        workflow=Workflow.EMERGENCY_TRIAGE,
+        step="selecting_slot",
+        patient_id=None,
+        slot_options=[{"id": "slot_em_book", "label": "Emergency slot"}],
+        collected_fields={
+            "first_name": "Eve",
+            "last_name": "Urgent",
+            "phone_number": "4165558888",
+            "emergency_summary": "Severe tooth pain",
+            "_is_emergency": True,
+            "appointment_type": "emergency",
+        },
+    )
+    response = _handle_slot_selection("1", state, db, "p1")
+    assert response.state.patient_id
+    low = response.reply.lower()
+    assert "confirm" in low or "set" in low or "see you" in low
+
+
 # ---------------------------------------------------------------------------
 # book_appointment
 # ---------------------------------------------------------------------------

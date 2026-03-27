@@ -883,6 +883,88 @@ def _handle_no_slots_retry(
 
 
 # ---------------------------------------------------------------------------
+# Patient resolution for slot booking (emergency / new chat has no patient_id yet)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_patient_id_for_slot_booking(
+    db: Session,
+    state: WorkflowState,
+    practice_id: str,
+) -> tuple[str | None, str | None]:
+    """
+    Return (patient_id, error_message).
+
+    Booking requires a chart id. Emergency triage collects name + phone but may not
+    set ``patient_id`` on state — create or look up a Patient row first.
+    """
+    if state.patient_id:
+        return state.patient_id, None
+
+    from datetime import date
+
+    from schemas.tools import CreatePatientInput, LookupPatientInput
+    from tools.patient_tools import create_patient, lookup_patient
+
+    cf = state.collected_fields
+    phone_raw = cf.get("phone_number")
+    fn = (cf.get("first_name") or "").strip()
+    ln = (cf.get("last_name") or "").strip() or "Patient"
+
+    if not phone_raw or not fn:
+        return None, (
+            "I couldn't complete the booking because your name or phone number wasn't on file. "
+            "Please reply with your full name and a 10-digit phone number, or call the office."
+        )
+
+    phone = str(phone_raw).strip()
+
+    lu = lookup_patient(
+        db,
+        LookupPatientInput(first_name=fn, last_name=ln, phone_number=phone),
+        practice_id=practice_id,
+    )
+    if lu.found and lu.patient:
+        return lu.patient.id, None
+
+    dob_val = cf.get("date_of_birth")
+    if isinstance(dob_val, date):
+        dob = dob_val
+    elif isinstance(dob_val, str):
+        try:
+            dob = date.fromisoformat(dob_val[:10])
+        except ValueError:
+            dob = date(1900, 1, 1)
+    else:
+        # Placeholder until staff verify — emergency intake often skips DOB
+        dob = date(1900, 1, 1)
+
+    cp = create_patient(
+        db,
+        CreatePatientInput(
+            first_name=fn,
+            last_name=ln,
+            phone_number=phone,
+            date_of_birth=dob,
+        ),
+        practice_id=practice_id,
+    )
+    if cp.success and cp.patient:
+        return cp.patient.id, None
+
+    if cp.error and "already exists" in (cp.error or "").lower():
+        lu2 = lookup_patient(
+            db,
+            LookupPatientInput(phone_number=phone),
+            practice_id=practice_id,
+        )
+        if lu2.found and lu2.patient:
+            return lu2.patient.id, None
+
+    return None, cp.error or "Could not save your information to book this appointment."
+
+
+# ---------------------------------------------------------------------------
 # Slot selection handler — called when step == 'selecting_slot'
 # ---------------------------------------------------------------------------
 
@@ -946,6 +1028,23 @@ def _handle_slot_selection(
     except ValueError:
         appt_code = "cleaning"
 
+    patient_id, patient_err = _resolve_patient_id_for_slot_booking(db, state, practice_id)
+    if patient_err or not patient_id:
+        return ChatResponse(
+            reply=(
+                "Sorry — I couldn't finalize that booking. "
+                f"{patient_err or 'Please try again or call the office.'}"
+            ),
+            state=state,
+        )
+
+    is_emergency_booking = bool(state.collected_fields.get("_is_emergency")) or appt_code == "emergency"
+    emergency_summary = (
+        state.collected_fields.get("emergency_summary")
+        or state.collected_fields.get("reason_for_visit")
+        or "Emergency visit (SMS chatbot)"
+    )
+
     is_reschedule = state.workflow == "reschedule_appointment"
 
     if is_reschedule:
@@ -967,10 +1066,13 @@ def _handle_slot_selection(
         result = book_appointment(
             db,
             BookAppointmentInput(
-                patient_id=state.patient_id,
+                patient_id=patient_id,
                 slot_id=slot_id,
                 appointment_type_code=appt_code,
                 booked_via="chatbot",
+                is_emergency=is_emergency_booking,
+                emergency_summary=emergency_summary if is_emergency_booking else None,
+                reason_for_visit=emergency_summary if is_emergency_booking else None,
             ),
         )
         success = result.success
@@ -1019,7 +1121,9 @@ def _handle_slot_selection(
         )
 
     confirm_reply = _append_maya_thread_signoff(confirm_reply)
-    new_state = workflow_state_after_completed_flow(state)
+    new_state = workflow_state_after_completed_flow(
+        state.model_copy(update={"patient_id": patient_id}) if patient_id else state
+    )
     return ChatResponse(
         reply=confirm_reply,
         state=new_state,

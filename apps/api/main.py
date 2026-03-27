@@ -6,7 +6,7 @@ from pydantic import BaseModel
 
 from config import get_settings
 from database import check_database_connection, init_db
-from routers import appointments, chat, clinic, patients
+from routers import appointments, chat, clinic, employee, patients
 
 
 class HealthResponse(BaseModel):
@@ -51,6 +51,7 @@ app.include_router(chat.router)
 app.include_router(patients.router)
 app.include_router(appointments.router)
 app.include_router(clinic.router)
+app.include_router(employee.router)
 
 
 # ---------------------------------------------------------------------------

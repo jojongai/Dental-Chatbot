@@ -386,6 +386,9 @@ Field value constraints:
   group_preference: exactly one of "back_to_back", "same_day", "same_provider", "any"
   family_count: integer
   confirmation: true (yes/agree/confirmed) or false (no/disagree/change)
+  phone_number: ONLY a North American 10-digit phone (e.g. 416-555-1234 or (416) 555-1234).
+    Never put a pain-severity number (1–10), "probably a 6", or any single digit here — those belong
+    in emergency_summary or nowhere if the patient only gave pain level without a phone.
 """
 
 
@@ -549,6 +552,14 @@ def _normalise_extracted(extracted: dict[str, Any]) -> dict[str, Any]:
                 "cancel_reason", "last_name",
             ):
                 out[key] = str(value).strip()
+            elif key == "phone_number":
+                from tools.validators import normalize_phone
+
+                try:
+                    out[key] = normalize_phone(str(value).strip())
+                except ValueError:
+                    # LLM often mislabels pain scores (e.g. "6" on a 1–10 scale) as phone_number.
+                    pass
             else:
                 out[key] = value
         except (ValueError, TypeError):

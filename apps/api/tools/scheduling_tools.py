@@ -5,10 +5,10 @@ cancel_appointment, book_family_appointments.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time as dt_time, timedelta
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from models.scheduling import Appointment, AppointmentRequest, AppointmentSlot, AppointmentType
@@ -30,6 +30,14 @@ from schemas.tools import (
     SearchSlotsOutput,
 )
 from tools.validators import fmt_date, fmt_time, fmt_time_range, normalize_appointment_type
+
+from models.patient import Patient
+from schemas.employee import (
+    EmployeeEmergencyAlert,
+    EmployeeScheduleAppointment,
+    EmployeeScheduleOut,
+    WeekDayCount,
+)
 
 TZ = ZoneInfo("America/Toronto")
 
@@ -94,6 +102,56 @@ def _appt_to_out(appt: Appointment, db: Session) -> AppointmentOut:
 # ---------------------------------------------------------------------------
 
 
+def _intervals_overlap(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime) -> bool:
+    return a_start < b_end and a_end > b_start
+
+
+def _exclude_slots_overlapping_provider_appointments(
+    db: Session, slots: list[AppointmentSlot]
+) -> list[AppointmentSlot]:
+    """
+    Drop slots whose provider already has a non-cancelled appointment overlapping
+    the same time window (any appointment type).
+
+    Needed when the DB has parallel slot rows per type (e.g. check-up + emergency
+    at identical times): booking one type must hide the other.
+    """
+    if not slots:
+        return []
+    provider_ids = {s.provider_id for s in slots if s.provider_id}
+    if not provider_ids:
+        return slots
+
+    min_st = min(s.starts_at for s in slots)
+    max_en = max(s.ends_at for s in slots)
+    rows = db.execute(
+        select(Appointment.provider_id, Appointment.scheduled_starts_at, Appointment.scheduled_ends_at).where(
+            Appointment.provider_id.in_(provider_ids),
+            Appointment.status.notin_(["cancelled", "rescheduled"]),
+            Appointment.scheduled_starts_at < max_en,
+            Appointment.scheduled_ends_at > min_st,
+        )
+    ).all()
+
+    busy = [(r[0], r[1], r[2]) for r in rows]
+    out: list[AppointmentSlot] = []
+    for slot in slots:
+        pid = slot.provider_id
+        if not pid:
+            out.append(slot)
+            continue
+        conflict = False
+        for bp, bs, be in busy:
+            if bp != pid:
+                continue
+            if _intervals_overlap(slot.starts_at, slot.ends_at, bs, be):
+                conflict = True
+                break
+        if not conflict:
+            out.append(slot)
+    return out
+
+
 def search_slots(db: Session, payload: SearchSlotsInput) -> SearchSlotsOutput:
     """
     Return available appointment_slots matching the criteria.
@@ -102,6 +160,8 @@ def search_slots(db: Session, payload: SearchSlotsInput) -> SearchSlotsOutput:
     - slot_status = 'available'
     - appointment_type.code matches payload.appointment_type_code
     - starts_at between date_from 00:00 and date_to 23:59 (Toronto time)
+    - starts_at >= now (Toronto) — no past or already-started slots
+    - no overlapping non-cancelled appointment for the same provider (any type)
     - preferred_time_of_day hour filter
     - Optional: location_id
 
@@ -123,6 +183,7 @@ def search_slots(db: Session, payload: SearchSlotsInput) -> SearchSlotsOutput:
     # Date window in Toronto timezone
     date_from_dt = datetime(payload.date_from.year, payload.date_from.month, payload.date_from.day, 0, 0, tzinfo=TZ)
     date_to_dt = datetime(payload.date_to.year, payload.date_to.month, payload.date_to.day, 23, 59, tzinfo=TZ)
+    now = datetime.now(tz=TZ)
 
     stmt = (
         select(AppointmentSlot)
@@ -130,6 +191,7 @@ def search_slots(db: Session, payload: SearchSlotsInput) -> SearchSlotsOutput:
         .where(AppointmentSlot.appointment_type_id == appt_type.id)
         .where(AppointmentSlot.starts_at >= date_from_dt)
         .where(AppointmentSlot.starts_at <= date_to_dt)
+        .where(AppointmentSlot.starts_at >= now)
         .order_by(AppointmentSlot.starts_at)
     )
     if payload.location_id:
@@ -142,6 +204,8 @@ def search_slots(db: Session, payload: SearchSlotsInput) -> SearchSlotsOutput:
     hour_min, hour_max = _TIME_RANGES.get(tod, (0, 24))
     if tod != "any":
         slots = [s for s in slots if hour_min <= s.starts_at.astimezone(TZ).hour < hour_max]
+
+    slots = _exclude_slots_overlapping_provider_appointments(db, slots)
 
     # Build output — up to 10
     slot_outs: list[SlotOut] = []
@@ -582,3 +646,117 @@ def book_family_appointments(db: Session, payload: BookFamilyAppointmentsInput) 
     """
     assigned, _ = assign_family_appointment_slots(db, payload)
     return _finalize_family_bookings(db, payload, assigned)
+
+
+# ---------------------------------------------------------------------------
+# Employee dashboard — day schedule + week counts
+# ---------------------------------------------------------------------------
+
+
+def _day_bounds_toronto(d: date) -> tuple[datetime, datetime]:
+    """Start inclusive, end exclusive, in America/Toronto."""
+    start = datetime.combine(d, dt_time.min, tzinfo=TZ)
+    end = start + timedelta(days=1)
+    return start, end
+
+
+def _map_ui_status(db_status: str) -> str:
+    return {
+        "booked": "confirmed",
+        "confirmed": "confirmed",
+        "checked_in": "arrived",
+        "completed": "completed",
+        "cancelled": "cancelled",
+        "no_show": "cancelled",
+        "rescheduled": "cancelled",
+    }.get(db_status, "confirmed")
+
+
+def get_employee_schedule(db: Session, target_date: date | None = None) -> EmployeeScheduleOut:
+    """Appointments for one calendar day, emergency banners, Mon–Sat counts for that week, provider count."""
+    if target_date is None:
+        target_date = datetime.now(tz=TZ).date()
+
+    day_start, day_end = _day_bounds_toronto(target_date)
+
+    rows = (
+        db.execute(
+            select(Appointment)
+            .where(Appointment.scheduled_starts_at >= day_start)
+            .where(Appointment.scheduled_starts_at < day_end)
+            .where(Appointment.status.notin_(["cancelled", "rescheduled"]))
+            .order_by(Appointment.scheduled_starts_at.asc())
+        )
+        .scalars()
+        .all()
+    )
+
+    appointments_out: list[EmployeeScheduleAppointment] = []
+    emergency_alerts: list[EmployeeEmergencyAlert] = []
+
+    for appt in rows:
+        patient = db.get(Patient, appt.patient_id)
+        appt_type = db.get(AppointmentType, appt.appointment_type_id)
+        provider = db.get(Provider, appt.provider_id) if appt.provider_id else None
+        starts = appt.scheduled_starts_at.astimezone(TZ)
+        duration_minutes = max(
+            1,
+            int((appt.scheduled_ends_at - appt.scheduled_starts_at).total_seconds() / 60),
+        )
+        ui_status = _map_ui_status(appt.status)
+        pname = f"{patient.first_name} {patient.last_name}" if patient else "Unknown"
+
+        appointments_out.append(
+            EmployeeScheduleAppointment(
+                id=appt.id,
+                patient_name=pname,
+                appointment_type_display=appt_type.display_name if appt_type else "Appointment",
+                appointment_type_code=appt_type.code if appt_type else "unknown",
+                time_start=fmt_time(starts),
+                duration_minutes=duration_minutes,
+                provider_display_name=provider.display_name if provider else None,
+                status=appt.status,
+                ui_status=ui_status,
+                is_emergency=appt.is_emergency,
+            )
+        )
+
+        if appt.is_emergency and appt.status not in ("cancelled", "rescheduled", "completed", "no_show"):
+            desc = (appt.emergency_summary or appt.reason_for_visit or "Emergency visit").strip()
+            emergency_alerts.append(
+                EmployeeEmergencyAlert(
+                    id=appt.id,
+                    patient_name=pname,
+                    description=desc,
+                    time=fmt_time(starts),
+                    severity="critical",
+                )
+            )
+
+    monday = target_date - timedelta(days=target_date.weekday())
+    labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+    week_day_counts: list[WeekDayCount] = []
+    for i in range(6):
+        d = monday + timedelta(days=i)
+        ds, de = _day_bounds_toronto(d)
+        cnt = db.execute(
+            select(func.count())
+            .select_from(Appointment)
+            .where(Appointment.scheduled_starts_at >= ds)
+            .where(Appointment.scheduled_starts_at < de)
+            .where(Appointment.status.notin_(["cancelled", "rescheduled"]))
+        ).scalar_one()
+        week_day_counts.append(WeekDayCount(day=labels[i], count=int(cnt), date=d))
+
+    provider_count = db.execute(
+        select(func.count()).select_from(Provider).where(Provider.is_bookable.is_(True))
+    ).scalar_one()
+
+    return EmployeeScheduleOut(
+        date=target_date,
+        timezone="America/Toronto",
+        appointments=appointments_out,
+        emergency_alerts=emergency_alerts,
+        week_day_counts=week_day_counts,
+        provider_count=int(provider_count),
+    )

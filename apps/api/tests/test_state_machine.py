@@ -83,7 +83,7 @@ class TestNewPatientRegistration:
             collected_fields={"first_name": "Sarah", "last_name": "Johnson"},
         )
         result = run(state, "You can reach me at (416) 555-7890")
-        assert result.state.collected_fields.get("phone_number") == "(416) 555-7890"
+        assert result.state.collected_fields.get("phone_number") == "4165557890"
 
     def test_extracts_date_of_birth(self):
         state = make_state(
@@ -170,7 +170,7 @@ class TestNewPatientRegistration:
         assert cf.get("first_name") == "Alice"
         assert cf.get("last_name") == "Chen"
         assert cf.get("date_of_birth") == date(1988, 1, 5)
-        assert cf.get("phone_number") == "647-555-3322"
+        assert cf.get("phone_number") == "6475553322"
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +207,7 @@ class TestExistingPatientVerification:
             collected_fields={"first_name": "Alice", "last_name": "Thompson"},
         )
         result = run(state, "My number is (416) 555-0201")
-        assert result.state.collected_fields.get("phone_number") == "(416) 555-0201"
+        assert result.state.collected_fields.get("phone_number") == "4165550201"
 
     def test_ready_when_all_three_present(self):
         state = make_state(
@@ -236,7 +236,7 @@ class TestExistingPatientVerification:
         result = run(state, "yes")
         assert result.tool_input_data.get("first_name") == "Alice"
         assert result.tool_input_data.get("last_name") == "Thompson"
-        assert result.tool_input_data.get("phone_number") == "(416) 555-0201"
+        assert result.tool_input_data.get("phone_number") == "4165550201"
 
 
 # ---------------------------------------------------------------------------
@@ -906,6 +906,13 @@ class TestNameNormalisation:
         result = _normalise_extracted({"first_name": "Joseph Ngai", "last_name": "Smith"})
         assert result["first_name"] == "Joseph"
         assert result["last_name"] == "Smith"
+
+    def test_pain_scale_digit_not_accepted_as_phone(self):
+        """LLMs sometimes label '6' (1–10 pain) as phone_number — reject it."""
+        from llm.interpreter import _normalise_extracted
+
+        assert _normalise_extracted({"phone_number": "6"}) == {}
+        assert _normalise_extracted({"phone_number": "(416) 555-1234"})["phone_number"] == "4165551234"
 
 
 class TestDefinitionsConsistency:
